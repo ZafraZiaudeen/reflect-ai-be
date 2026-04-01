@@ -1,0 +1,36 @@
+{
+  "name": "reflect-ai-be",
+  "version": "1.0.0",
+  "description": "Project Mirror API and realtime voice worker",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "agent:dev": "tsx src/Infrastructure/Voice/mirrorAgent.runner.ts dev",
+    "agent:start": "node dist/Infrastructure/Voice/mirrorAgent.runner.js start",
+    "agent:connect": "tsx src/Infrastructure/Voice/mirrorAgent.runner.ts connect"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@clerk/express": "^2.0.8",
+    "@livekit/agents": "^1.2.2",
+    "@livekit/agents-plugin-openai": "^1.2.2",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "livekit-server-sdk": "^2.15.0",
+    "mongoose": "^9.3.3",
+    "nodemon": "^3.1.14",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

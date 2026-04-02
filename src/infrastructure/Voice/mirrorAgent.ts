@@ -19,6 +19,8 @@ type AgentMetadata = {
   partnerBUserId?: string;
   partnerBName?: string;
   homeworkTitle?: string;
+  reflectionContext?: string;
+  hasReflections?: string;
 };
 
 type HumanParticipant = {
@@ -75,6 +77,85 @@ const PARTNER_WAIT_TIMEOUT_MS = 15_000;
 const INTERRUPTION_MIN_DURATION_MS = 550;
 const INTERRUPTION_MIN_WORDS = 2;
 const AUDIO_OUTPUT_SUBSCRIPTION_GRACE_MS = 1_500;
+
+/* ------------------------------------------------------------------ */
+/*  Real-time honesty scoring (mirrors voiceWebSocket implementation)   */
+/* ------------------------------------------------------------------ */
+
+const HONESTY_RULES = {
+  defensiveness: {
+    patterns: [
+      /not my fault/i, /you started/i, /that's because you/i, /i only did that because/i,
+      /i was just trying to/i, /you made me/i, /what about when you/i,
+    ],
+    honestyDelta: -12,
+    escalationDelta: 10,
+  },
+  criticism: {
+    patterns: [/you always/i, /you never/i, /what is wrong with you/i, /why can't you/i, /every single time/i],
+    honestyDelta: -10,
+    escalationDelta: 8,
+  },
+  contempt: {
+    patterns: [/ridiculous/i, /pathetic/i, /disgusting/i, /embarrassing/i, /you're crazy/i, /grow up/i, /whatever/i],
+    honestyDelta: -18,
+    escalationDelta: 14,
+  },
+  stonewalling: {
+    patterns: [/i'm done/i, /leave me alone/i, /i don't care/i, /forget it/i, /there's no point/i],
+    honestyDelta: -14,
+    escalationDelta: 11,
+  },
+  denial: {
+    patterns: [/i don't do that/i, /that's not true/i, /you're wrong/i, /i didn't say that/i, /that's not what happened/i],
+    honestyDelta: -10,
+    escalationDelta: 12,
+  },
+  aiAttack: {
+    patterns: [
+      /you're just (a|an) (bot|ai|machine)/i, /what do you know/i, /shut up/i,
+      /you're not (a|my) therapist/i, /you don't know/i,
+    ],
+    honestyDelta: -8,
+    escalationDelta: 18,
+  },
+  accountability: {
+    patterns: [
+      /i realize/i, /i was wrong/i, /my fault/i, /i should have/i, /i'm sorry/i,
+      /i need to work on/i, /you're right/i, /i admit/i, /i take responsibility/i,
+    ],
+    honestyDelta: 6,
+    escalationDelta: -8,
+  },
+};
+
+const analyzeUtteranceForHonesty = (text: string): { honestyDelta: number; escalationDelta: number } => {
+  let honestyDelta = 0;
+  let escalationDelta = 0;
+  let matched = false;
+
+  for (const [, rule] of Object.entries(HONESTY_RULES)) {
+    for (const pattern of rule.patterns) {
+      if (pattern.test(text)) {
+        honestyDelta += rule.honestyDelta;
+        escalationDelta += rule.escalationDelta;
+        matched = true;
+        break;
+      }
+    }
+  }
+
+  // Natural cool-down if nothing detected
+  if (!matched) {
+    honestyDelta += 1;
+    escalationDelta -= 3;
+  }
+
+  return { honestyDelta, escalationDelta };
+};
+
+const clampScore = (value: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, Math.round(value)));
 
 const THERAPIST_GUARDRAILS = [
   'You are Project Mirror, a world-class couples mediator.',
@@ -233,7 +314,16 @@ const buildFullWelcomeLine = (args: {
   partnerAName: string;
   partnerBName: string;
   homeworkTitle?: string;
+  hasReflections?: boolean;
 }): string => {
+  if (args.hasReflections) {
+    return [
+      `Welcome back, ${args.partnerAName} and ${args.partnerBName}.`,
+      'Before we do anything else, I want to talk about what you both wrote in your reflections.',
+      'I have read every word. Let us see if you meant them.',
+    ].join(' ');
+  }
+
   const homeworkCheck = args.homeworkTitle
     ? `Before either of you performs, tell me whether you actually completed "${args.homeworkTitle}".`
     : 'I am here for relationship truth, not polished excuses.';
@@ -431,17 +521,45 @@ export default defineAgent({
     const humanParticipants = new Map<string, HumanParticipant>();
     const evidenceEntries: EvidenceEntry[] = [];
 
-    const buildVoiceAgent = (modelId: string) =>
-      new voice.Agent({
-        instructions: [
-          THERAPIST_GUARDRAILS,
-          'Respond with Gemini Live-style energy: quick turn-taking, low dead air, and short spoken replies that sound present in the room.',
-          'When one partner speaks directly to you, answer immediately instead of waiting for a long exchange.',
-          `Partner A is ${coupleContext.partnerAName}.`,
-          `Partner B is ${coupleContext.partnerBName || 'Partner B'}.`,
-        ].join(' '),
+    // Track honesty metrics in real-time
+    let honestyScore = 50; // Start at neutral baseline
+    let escalationLevel = 25;
+    const HONESTY_UPDATE_INTERVAL = 5; // Update DB every N utterances
+    let utterancesSinceHonestyUpdate = 0;
+
+    const buildVoiceAgent = (modelId: string) => {
+      const instructionParts = [
+        THERAPIST_GUARDRAILS,
+        'Respond with Gemini Live-style energy: quick turn-taking, low dead air, and short spoken replies that sound present in the room.',
+        'When one partner speaks directly to you, answer immediately instead of waiting for a long exchange.',
+        `Partner A is ${coupleContext.partnerAName}.`,
+        `Partner B is ${coupleContext.partnerBName || 'Partner B'}.`,
+      ];
+
+      // Include the full opening context (which now contains ALL reflection history)
+      const openingContext = sessionRecord?.openingContext || metadata.openingContext || '';
+      if (openingContext) {
+        instructionParts.push('');
+        instructionParts.push('SESSION CONTEXT AND MEMORY:');
+        instructionParts.push(openingContext);
+      }
+
+      // Include reflection context if available
+      const reflectionCtx = metadata.reflectionContext || '';
+      if (reflectionCtx) {
+        instructionParts.push('');
+        instructionParts.push('CRITICAL INSTRUCTION — REFLECTION REVIEW:');
+        instructionParts.push('When both partners are in the room, your FIRST priority is to review and discuss the reflections they wrote.');
+        instructionParts.push('Read their reflections back to them. Ask if they meant what they wrote. Push for honesty.');
+        instructionParts.push('Do NOT move to general conversation until you have addressed the reflections.');
+        instructionParts.push(reflectionCtx);
+      }
+
+      return new voice.Agent({
+        instructions: instructionParts.join(' '),
         llm: createOpenRouterLlm(modelId, 0.42),
       });
+    };
 
     let currentAgent = buildVoiceAgent(modelAttempts[currentModelIndex]!.id);
 
@@ -706,13 +824,32 @@ export default defineAgent({
       if (participantCount >= 2 && !welcomedBothPartners) {
         welcomedBothPartners = true;
         clearSoloStartTimer();
+
+        const hasReflections = metadata.hasReflections === 'true';
         speakLine(
           buildFullWelcomeLine({
             partnerAName: coupleContext.partnerAName,
             partnerBName: coupleContext.partnerBName || 'Partner B',
             homeworkTitle: coupleContext.homeworkTitle,
+            hasReflections,
           }),
         );
+
+        // If there are reflections, queue a follow-up prompt to discuss them
+        if (hasReflections) {
+          setTimeout(() => {
+            queuePrompt(
+              [
+                'Now review the reflections both partners wrote (included in your context).',
+                'Summarize what each partner wrote in their own words.',
+                'Ask each partner directly: "Did you mean what you wrote, or were you performing for the exercise?"',
+                'Look for contradictions between their reflections and their past behavior.',
+                'Do NOT move on to new topics until the reflections have been discussed and both partners have responded.',
+              ].join(' '),
+              true,
+            );
+          }, 6_000);
+        }
       }
     };
 
@@ -786,6 +923,17 @@ export default defineAgent({
         source: 'livekit-user',
         tags: ['canonical-livekit'],
       });
+
+      // Real-time honesty scoring
+      const honestyAnalysis = analyzeUtteranceForHonesty(transcript);
+      honestyScore = clampScore(honestyScore + honestyAnalysis.honestyDelta, 1, 100);
+      escalationLevel = clampScore(escalationLevel + honestyAnalysis.escalationDelta, 0, 100);
+
+      utterancesSinceHonestyUpdate += 1;
+      if (utterancesSinceHonestyUpdate >= HONESTY_UPDATE_INTERVAL) {
+        utterancesSinceHonestyUpdate = 0;
+        void VoiceTelemetryApplication.updateHonestyScore(sessionId, honestyScore);
+      }
 
       if (!welcomedBothPartners) {
         return;
@@ -929,4 +1077,4 @@ export default defineAgent({
   },
 });
 
-export const mirrorAgentPath = fileURLToPath(new URL('./mirrorAgent.ts', import.meta.url));
+export const mirrorAgentPath = fileURLToPath(import.meta.url);

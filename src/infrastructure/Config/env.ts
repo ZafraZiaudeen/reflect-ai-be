@@ -24,6 +24,7 @@ const envSchema = z.object({
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
   SMTP_FROM: z.string().optional(),
+  HUGGINGFACE_API_KEY: z.string().optional(),
 });
 
 const parsed = envSchema.parse(process.env);

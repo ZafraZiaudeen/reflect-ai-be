@@ -1,0 +1,376 @@
+import { Types } from 'mongoose';
+import {
+  ReflectionMemoryModel,
+  type ReflectionMemoryDocument,
+} from '../domain/Models/ReflectionMemory.js';
+import type { CoupleDocument } from '../domain/Models/Couple.js';
+import { generateEmbedding, cosineSimilarity } from '../infrastructure/Embeddings/embeddingService.js';
+import { toObjectIdString } from '../domain/Types/mirror.js';
+
+/* ------------------------------------------------------------------ */
+/*  Store reflections with embeddings                                   */
+/* ------------------------------------------------------------------ */
+
+export class MemoryApplication {
+  /**
+   * Store a partner's reflection with its vector embedding.
+   * Called when a partner submits homework.
+   */
+  static async storeReflection(args: {
+    coupleId: string;
+    sessionId: string;
+    userId: string;
+    partnerRole: 'partner_a' | 'partner_b';
+    partnerName: string;
+    assignmentTitle: string;
+    reflectionPrompt: string;
+    reflectionText: string;
+    sessionSummary?: string;
+  }): Promise<void> {
+    try {
+      const embeddingText = `${args.assignmentTitle}: ${args.reflectionText}`;
+      const embedding = await generateEmbedding(embeddingText);
+
+      // Count existing reflections to determine session number
+      const existingCount = await ReflectionMemoryModel.countDocuments({
+        coupleId: new Types.ObjectId(args.coupleId),
+        userId: { $ne: 'system' },
+      });
+      const sessionNumber = Math.floor(existingCount / 2) + 1;
+
+      // Upsert: replace existing reflection for same user + session + assignment
+      await ReflectionMemoryModel.findOneAndUpdate(
+        {
+          coupleId: new Types.ObjectId(args.coupleId),
+          sessionId: new Types.ObjectId(args.sessionId),
+          userId: args.userId,
+          assignmentTitle: args.assignmentTitle,
+        },
+        {
+          $set: {
+            partnerRole: args.partnerRole,
+            partnerName: args.partnerName,
+            reflectionPrompt: args.reflectionPrompt,
+            reflectionText: args.reflectionText,
+            sessionSummary: args.sessionSummary || '',
+            embedding,
+            sessionNumber,
+          },
+          $setOnInsert: {
+            coupleId: new Types.ObjectId(args.coupleId),
+            sessionId: new Types.ObjectId(args.sessionId),
+            userId: args.userId,
+            assignmentTitle: args.assignmentTitle,
+          },
+        },
+        { upsert: true },
+      );
+    } catch (error) {
+      console.warn('[memory] Failed to store reflection embedding:', error);
+    }
+  }
+
+  /**
+   * Store a session summary as a searchable memory entry.
+   * Called when a session completes with a truth report.
+   */
+  static async storeSessionSummary(args: {
+    coupleId: string;
+    sessionId: string;
+    truthSummary: string;
+    coreConflict: string;
+    observedPatterns: string[];
+  }): Promise<void> {
+    try {
+      const summaryText = [
+        `Session Summary: ${args.truthSummary}`,
+        `Core conflict: ${args.coreConflict}`,
+        `Observed patterns: ${args.observedPatterns.join(', ')}`,
+      ].join('. ');
+
+      const embedding = await generateEmbedding(summaryText);
+
+      await ReflectionMemoryModel.findOneAndUpdate(
+        {
+          coupleId: new Types.ObjectId(args.coupleId),
+          sessionId: new Types.ObjectId(args.sessionId),
+          userId: 'system',
+          assignmentTitle: 'Session Summary',
+        },
+        {
+          $set: {
+            partnerRole: 'system',
+            partnerName: 'Mirror',
+            reflectionPrompt: 'session-summary',
+            reflectionText: summaryText,
+            sessionSummary: args.truthSummary,
+            embedding,
+            sessionNumber: 0,
+          },
+          $setOnInsert: {
+            coupleId: new Types.ObjectId(args.coupleId),
+            sessionId: new Types.ObjectId(args.sessionId),
+            userId: 'system',
+            assignmentTitle: 'Session Summary',
+          },
+        },
+        { upsert: true },
+      );
+    } catch (error) {
+      console.warn('[memory] Failed to store session summary embedding:', error);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Retrieve reflections                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Retrieve ALL reflections for a couple, ordered chronologically.
+   * This gives the AI complete knowledge of what both partners have written.
+   */
+  static async getAllReflections(coupleId: string): Promise<ReflectionMemoryDocument[]> {
+    return ReflectionMemoryModel.find({
+      coupleId: new Types.ObjectId(coupleId),
+      userId: { $ne: 'system' },
+    })
+      .sort({ createdAt: 1 })
+      .exec();
+  }
+
+  /**
+   * Retrieve all session summaries for a couple, ordered chronologically.
+   */
+  static async getAllSessionSummaries(coupleId: string): Promise<ReflectionMemoryDocument[]> {
+    return ReflectionMemoryModel.find({
+      coupleId: new Types.ObjectId(coupleId),
+      userId: 'system',
+    })
+      .sort({ createdAt: 1 })
+      .exec();
+  }
+
+  /**
+   * Semantic search: find reflections similar to a query string.
+   * Attempts Atlas $vectorSearch first, falls back to manual cosine similarity.
+   */
+  static async searchSimilarReflections(args: {
+    coupleId: string;
+    query: string;
+    limit?: number;
+  }): Promise<Array<ReflectionMemoryDocument & { similarity: number }>> {
+    const queryEmbedding = await generateEmbedding(args.query);
+    const limit = args.limit || 10;
+
+    // Attempt Atlas Vector Search
+    try {
+      const results = await ReflectionMemoryModel.aggregate([
+        {
+          $vectorSearch: {
+            index: 'reflection_vector_index',
+            path: 'embedding',
+            queryVector: queryEmbedding,
+            numCandidates: limit * 10,
+            limit,
+            filter: {
+              coupleId: new Types.ObjectId(args.coupleId),
+            },
+          },
+        },
+        {
+          $addFields: {
+            similarity: { $meta: 'vectorSearchScore' },
+          },
+        },
+      ]);
+
+      if (results.length > 0) {
+        return results;
+      }
+    } catch {
+      // Atlas Vector Search not available — fall through to manual approach
+    }
+
+    // Fallback: manual cosine similarity
+    const allMemories = await ReflectionMemoryModel.find({
+      coupleId: new Types.ObjectId(args.coupleId),
+    }).exec();
+
+    return allMemories
+      .filter((mem) => mem.embedding && mem.embedding.length > 0 && mem.embedding.some((v) => v !== 0))
+      .map((mem) => {
+        const doc = mem.toObject() as ReflectionMemoryDocument & { similarity: number };
+        (doc as unknown as Record<string, unknown>).similarity = cosineSimilarity(queryEmbedding, mem.embedding);
+        return doc;
+      })
+      .sort((a, b) => (b as unknown as { similarity: number }).similarity - (a as unknown as { similarity: number }).similarity)
+      .slice(0, limit) as unknown as Array<ReflectionMemoryDocument & { similarity: number }>;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Context builders for AI sessions                                   */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Build a comprehensive, chronological reflection context that gives the AI
+   * FULL knowledge of every reflection ever written by both partners.
+   */
+  static async buildReflectionContext(args: {
+    coupleId: string;
+    couple: CoupleDocument;
+  }): Promise<string> {
+    const allReflections = await this.getAllReflections(args.coupleId);
+
+    if (allReflections.length === 0) {
+      return '';
+    }
+
+    const partnerAName = args.couple.partnerAName;
+    const partnerBName = args.couple.partnerBName || 'Partner B';
+
+    const parts: string[] = [
+      '=== COMPLETE REFLECTION HISTORY (ALL SESSIONS) ===',
+      `Total reflections on record: ${allReflections.length}`,
+      '',
+    ];
+
+    // Group by session
+    const bySession = new Map<string, ReflectionMemoryDocument[]>();
+    for (const ref of allReflections) {
+      const key = toObjectIdString(ref.sessionId);
+      if (!bySession.has(key)) {
+        bySession.set(key, []);
+      }
+      bySession.get(key)!.push(ref);
+    }
+
+    let sessionIdx = 1;
+    for (const [, refs] of bySession) {
+      parts.push(`--- After Session ${sessionIdx} ---`);
+
+      for (const ref of refs) {
+        const name = ref.partnerRole === 'partner_a' ? partnerAName : partnerBName;
+        parts.push(`${name}'s reflection on "${ref.assignmentTitle}":`);
+        parts.push(`  Prompt asked: "${ref.reflectionPrompt}"`);
+        parts.push(`  Their response: "${ref.reflectionText}"`);
+        if (ref.sessionSummary) {
+          parts.push(`  Session context: ${ref.sessionSummary}`);
+        }
+        parts.push(`  Written on: ${ref.createdAt.toISOString().split('T')[0]}`);
+        parts.push('');
+      }
+
+      sessionIdx++;
+    }
+
+    return parts.join('\n');
+  }
+
+  /**
+   * Build the current homework gate reflections formatted for the AI to
+   * discuss at the start of the next session.
+   */
+  static buildCurrentReflectionsForDiscussion(couple: CoupleDocument): string {
+    const gate = couple.activeHomeworkGate;
+    if (!gate || gate.assignments.length === 0) {
+      return '';
+    }
+
+    const partnerAName = couple.partnerAName;
+    const partnerBName = couple.partnerBName || 'Partner B';
+
+    const parts: string[] = [
+      '=== REFLECTIONS TO DISCUSS THIS SESSION ===',
+      'YOU MUST review these reflections with both partners before moving to any other topic.',
+      'Read their words back to them. Ask if they meant it. Push for honesty.',
+      '',
+    ];
+
+    for (const assignment of gate.assignments) {
+      parts.push(`Assignment: "${assignment.title}"`);
+      parts.push(`Description: ${assignment.description}`);
+      parts.push(`Prompt: "${assignment.reflectionPrompt}"`);
+      parts.push('');
+
+      for (const reflection of assignment.reflections) {
+        const isPartnerA = reflection.userId === couple.partnerAUserId;
+        const name = isPartnerA ? partnerAName : partnerBName;
+        parts.push(`  ${name} wrote (completed: ${reflection.completed}):`);
+        parts.push(`  "${reflection.reflection}"`);
+        parts.push('');
+      }
+
+      if (assignment.reflections.length === 0) {
+        parts.push('  WARNING: No reflections submitted. Call this out immediately.');
+        parts.push('');
+      }
+
+      const partnerAReflection = assignment.reflections.find(
+        (r) => r.userId === couple.partnerAUserId,
+      );
+      const partnerBReflection = assignment.reflections.find(
+        (r) => r.userId === couple.partnerBUserId,
+      );
+
+      if (!partnerAReflection) {
+        parts.push(`  ${partnerAName} DID NOT submit a reflection. Confront them about this.`);
+      }
+      if (!partnerBReflection) {
+        parts.push(`  ${partnerBName} DID NOT submit a reflection. Confront them about this.`);
+      }
+      parts.push('');
+    }
+
+    return parts.join('\n');
+  }
+
+  /**
+   * Build the enriched opening context for a new session.
+   * Combines: previous summary + ALL past reflections + session summaries +
+   * current homework reflections to discuss.
+   */
+  static async buildEnrichedOpeningContext(args: {
+    coupleId: string;
+    couple: CoupleDocument;
+    previousSummary: string;
+  }): Promise<string> {
+    const parts: string[] = [];
+
+    // Previous session summary
+    if (args.previousSummary) {
+      parts.push(`Previous session memory: ${args.previousSummary}`);
+    } else {
+      parts.push("This is the couple's first session — no prior session memory exists yet.");
+    }
+
+    // All past session summaries from vector memory
+    const sessionSummaries = await this.getAllSessionSummaries(args.coupleId);
+    if (sessionSummaries.length > 0) {
+      parts.push('');
+      parts.push('=== ALL PAST SESSION SUMMARIES ===');
+      for (let i = 0; i < sessionSummaries.length; i++) {
+        parts.push(`Session ${i + 1}: ${sessionSummaries[i].reflectionText}`);
+      }
+    }
+
+    // Complete reflection history
+    const reflectionContext = await this.buildReflectionContext({
+      coupleId: args.coupleId,
+      couple: args.couple,
+    });
+
+    if (reflectionContext) {
+      parts.push('');
+      parts.push(reflectionContext);
+    }
+
+    // Current homework reflections to discuss in this session
+    const currentReflections = this.buildCurrentReflectionsForDiscussion(args.couple);
+    if (currentReflections) {
+      parts.push('');
+      parts.push(currentReflections);
+    }
+
+    return parts.join('\n');
+  }
+}

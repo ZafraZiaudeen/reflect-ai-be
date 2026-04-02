@@ -82,20 +82,33 @@ export const inferCoreConflict = (transcriptSegments: TranscriptSegment[]): stri
   return scored[0]?.score ? `Recurring conflict around ${scored[0].label}` : 'Breakdown in accountability and emotional safety';
 };
 
-export const buildDefaultHomework = (coreConflict: string): HomeworkAssignment[] => [
-  {
-    id: randomUUID(),
-    title: 'Truth Window',
-    description: `Each partner writes one paragraph naming their part in the ${coreConflict.toLowerCase()}.`,
-    reflectionPrompt: 'What part of this conflict are you still minimizing or hiding from your partner?',
-  },
-  {
-    id: randomUUID(),
-    title: 'Repair Attempt',
-    description: 'Schedule one 15-minute check-in with no rebuttals, only reflection and acknowledgement.',
-    reflectionPrompt: 'What did you hear that you usually argue with instead of absorbing?',
-  },
-];
+/**
+ * Build fallback homework when the LLM fails to generate dynamic prompts.
+ * These are still tailored to the core conflict rather than being fully static.
+ */
+export const buildDefaultHomework = (
+  coreConflict: string,
+  observedPatterns: string[] = [],
+): HomeworkAssignment[] => {
+  const patternClause = observedPatterns.length > 0
+    ? ` The patterns observed were: ${observedPatterns.join(', ')}.`
+    : '';
+
+  return [
+    {
+      id: randomUUID(),
+      title: 'Truth Window',
+      description: `Each partner writes one paragraph naming their specific part in the ${coreConflict.toLowerCase()}.${patternClause}`,
+      reflectionPrompt: `Thinking about the ${coreConflict.toLowerCase()} discussed in this session: What specific thing did YOU do or say that made things worse? Do not mention your partner — only your own actions.`,
+    },
+    {
+      id: randomUUID(),
+      title: 'Pattern Recognition',
+      description: `Identify one moment from this session where you fell into a destructive pattern${patternClause ? ' (' + observedPatterns.join(', ') + ')' : ''} and describe what you could have done instead.`,
+      reflectionPrompt: `Name one specific moment from this session where you were not being fully honest or accountable. What were you actually feeling underneath the reaction?`,
+    },
+  ];
+};
 
 export const clampHonestyScore = (value: number): number => Math.max(1, Math.min(100, Math.round(value)));
 
@@ -118,7 +131,7 @@ export const buildFallbackTruthReport = (
     coreConflict,
     truthSummary,
     observedPatterns,
-    homework: buildDefaultHomework(coreConflict),
+    homework: buildDefaultHomework(coreConflict, observedPatterns),
     nextGoal: 'Return with evidence that both partners can name their contribution without immediately counterattacking.',
     honestyScore,
     clinicalFrame: 'Direct professional',
@@ -158,12 +171,30 @@ export const buildSessionContextSummary = (
   previousSummary: string,
   gate: HomeworkGate | null | undefined,
 ): string => {
-  const gateSummary = summarizeHomeworkGate(gate);
-  if (!previousSummary) {
-    return `No prior session memory is stored yet. Current gate: ${gateSummary}`;
+  const parts: string[] = [];
+
+  if (previousSummary) {
+    parts.push(`Previous session memory: ${previousSummary}`);
+  } else {
+    parts.push('This is the couple\'s first session — no prior session memory exists yet.');
   }
 
-  return `Memory summary: ${previousSummary}. Current gate: ${gateSummary}`;
+  const gateSummary = summarizeHomeworkGate(gate);
+  parts.push(`Homework gate status: ${gateSummary}`);
+
+  // Include homework reflection content if available
+  if (gate?.assignments) {
+    for (const assignment of gate.assignments) {
+      if (assignment.reflections.length > 0) {
+        parts.push(`Homework "${assignment.title}":`);
+        for (const reflection of assignment.reflections) {
+          parts.push(`  - Partner reflection (completed: ${reflection.completed}): "${reflection.reflection}"`);
+        }
+      }
+    }
+  }
+
+  return parts.join('\n');
 };
 
 const countWords = (value: string): number =>

@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist/agent",
+    "tsBuildInfoFile": "./dist/.tsbuildinfo.agent"
+  },
+  "include": [
+    "src/apps/agent/**/*.ts",
+    "src/application/VoiceTelemetryApplication.ts",
+    "src/domain/**/*.ts",
+    "src/infrastructure/Config/**/*.ts",
+    "src/infrastructure/Database/**/*.ts",
+    "src/infrastructure/OpenRouter/**/*.ts",
+    "src/infrastructure/Voice/mirrorAgent.ts",
+    "src/types/**/*.d.ts"
+  ]
+}

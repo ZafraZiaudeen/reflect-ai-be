@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+buildCommand = "npm run build:agent"
+
+[deploy]
+startCommand = "npm run start:agent"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5

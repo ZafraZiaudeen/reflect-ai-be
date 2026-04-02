@@ -1,5 +1,5 @@
 import { Schema, model, type HydratedDocument, type Model } from 'mongoose';
-import type { HomeworkGate } from '../Types/mirror.js';
+import type { HomeworkGate, WorkspaceInvitation } from '../Types/mirror.js';
 
 const HomeworkReflectionSchema = new Schema(
   {
@@ -33,6 +33,17 @@ const HomeworkGateSchema = new Schema<HomeworkGate>(
   { _id: false },
 );
 
+const WorkspaceInvitationSchema = new Schema<WorkspaceInvitation>(
+  {
+    email: { type: String, required: true },
+    recipientName: { type: String },
+    invitedByUserId: { type: String, required: true },
+    invitedByName: { type: String, required: true },
+    sentAt: { type: Date, required: true },
+  },
+  { _id: false },
+);
+
 export interface CoupleRecord {
   inviteCode: string;
   partnerAUserId: string;
@@ -46,6 +57,7 @@ export interface CoupleRecord {
   preferredModel: string;
   memorySummary: string;
   activeHomeworkGate?: HomeworkGate | null;
+  pendingInvitation?: WorkspaceInvitation | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -66,6 +78,7 @@ const CoupleSchema = new Schema<CoupleRecord>(
     preferredModel: { type: String, required: true },
     memorySummary: { type: String, default: '' },
     activeHomeworkGate: { type: HomeworkGateSchema, default: null },
+    pendingInvitation: { type: WorkspaceInvitationSchema, default: null },
   },
   {
     timestamps: true,

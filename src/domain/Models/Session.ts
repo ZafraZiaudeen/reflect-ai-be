@@ -76,6 +76,7 @@ export interface SessionRecord {
   roomName: string;
   status: SessionStatus;
   selectedModel: string;
+  createdByUserId: string;
   liveKitDispatchId?: string;
   agentDispatchRequestedAt?: Date;
   openingContext: string;
@@ -97,6 +98,7 @@ const SessionSchema = new Schema<SessionRecord>(
     roomName: { type: String, required: true, unique: true, index: true },
     status: { type: String, required: true, default: 'pending' },
     selectedModel: { type: String, required: true },
+    createdByUserId: { type: String, default: '' },
     liveKitDispatchId: { type: String },
     agentDispatchRequestedAt: { type: Date },
     openingContext: { type: String, default: '' },

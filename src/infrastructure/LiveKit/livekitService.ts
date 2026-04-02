@@ -3,10 +3,12 @@ import { env, ensureEnvValue } from '../Config/env.js';
 
 interface DispatchInput {
   roomName: string;
-  sessionId: string;
-  coupleId: string;
-  selectedModel: string;
-  openingContext: string;
+  metadata: Record<string, string>;
+}
+
+interface DeleteDispatchInput {
+  roomName: string;
+  dispatchId: string;
 }
 
 interface TokenInput {
@@ -26,6 +28,13 @@ const getLiveKitControlHost = (): string => {
   }
   return liveKitUrl;
 };
+
+const createDispatchClient = (): AgentDispatchClient =>
+  new AgentDispatchClient(
+    getLiveKitControlHost(),
+    ensureEnvValue(env.LIVEKIT_API_KEY, 'LIVEKIT_API_KEY'),
+    ensureEnvValue(env.LIVEKIT_API_SECRET, 'LIVEKIT_API_SECRET'),
+  );
 
 export const createParticipantToken = async ({
   roomName,
@@ -59,25 +68,21 @@ export const createParticipantToken = async ({
 
 export const dispatchMirrorAgent = async ({
   roomName,
-  sessionId,
-  coupleId,
-  selectedModel,
-  openingContext,
+  metadata,
 }: DispatchInput): Promise<string> => {
-  const dispatchClient = new AgentDispatchClient(
-    getLiveKitControlHost(),
-    ensureEnvValue(env.LIVEKIT_API_KEY, 'LIVEKIT_API_KEY'),
-    ensureEnvValue(env.LIVEKIT_API_SECRET, 'LIVEKIT_API_SECRET'),
-  );
+  const dispatchClient = createDispatchClient();
 
   const dispatch = await dispatchClient.createDispatch(roomName, env.LIVEKIT_AGENT_NAME, {
-    metadata: JSON.stringify({
-      sessionId,
-      coupleId,
-      selectedModel,
-      openingContext,
-    }),
+    metadata: JSON.stringify(metadata),
   });
 
   return dispatch.id;
+};
+
+export const clearMirrorAgentDispatch = async ({
+  roomName,
+  dispatchId,
+}: DeleteDispatchInput): Promise<void> => {
+  const dispatchClient = createDispatchClient();
+  await dispatchClient.deleteDispatch(dispatchId, roomName);
 };

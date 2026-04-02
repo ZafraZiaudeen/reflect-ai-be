@@ -42,6 +42,14 @@ export interface HomeworkGate {
   unlockedAt?: Date | null;
 }
 
+export interface WorkspaceInvitation {
+  email: string;
+  recipientName?: string;
+  invitedByUserId: string;
+  invitedByName: string;
+  sentAt: Date;
+}
+
 export interface TranscriptSegment {
   speakerUserId?: string | null;
   speakerRole: SpeakerRole;
@@ -51,7 +59,7 @@ export interface TranscriptSegment {
   startedAtMs?: number;
   endedAtMs?: number;
   confidence?: number;
-  source: 'frontend-webspeech' | 'agent-livekit' | 'system';
+  source: 'frontend-webspeech' | 'livekit-user' | 'agent-livekit' | 'system';
   tags: string[];
 }
 
@@ -100,6 +108,7 @@ export interface CoupleSummary {
   };
   memorySummary: string;
   activeHomeworkGate: HomeworkGate | null;
+  pendingInvitation: WorkspaceInvitation | null;
 }
 
 export interface SessionSummary {
@@ -108,6 +117,7 @@ export interface SessionSummary {
   roomName: string;
   status: SessionStatus;
   selectedModel: string;
+  createdByUserId: string;
   startedAt?: string | null;
   endedAt?: string | null;
   report?: TruthReport | null;
@@ -122,6 +132,7 @@ export interface DashboardResponse {
   models: ModelOption[];
   canStartSession: boolean;
   blockerReason?: string;
+  activeSession?: SessionSummary | null;
 }
 
 export interface CreateCoupleInput {
@@ -132,6 +143,11 @@ export interface CreateCoupleInput {
 
 export interface JoinCoupleInput extends CreateCoupleInput {
   inviteCode: string;
+}
+
+export interface SendWorkspaceInviteInput {
+  email: string;
+  recipientName?: string;
 }
 
 export interface HomeworkReflectionInput {
@@ -147,38 +163,49 @@ export interface PartnerTranscriptInput {
   confidence?: number;
 }
 
-export const DEFAULT_MODEL_ID = 'anthropic/claude-sonnet-4';
+export const DEFAULT_MODEL_ID = 'anthropic/claude-sonnet-4.6';
+export const REPORT_MODEL_ID = 'openai/gpt-5.2-chat';
 
 export const MODEL_CATALOG: ModelOption[] = [
   {
-    id: 'anthropic/claude-sonnet-4',
-    label: 'Claude Sonnet 4',
+    id: 'anthropic/claude-sonnet-4.6',
+    label: 'Claude Sonnet 4.6',
     provider: 'OpenRouter',
     supportsVoice: true,
     isDefault: true,
-    description: 'Best overall balance for nuanced, high-empathy confrontation.',
+    description: 'Balanced default for live sessions with sharp therapeutic language and strong nuance.',
     latency: 'balanced',
-    fallbackModelIds: ['anthropic/claude-3.7-sonnet', 'openai/gpt-4.1'],
+    fallbackModelIds: ['anthropic/claude-opus-4.5', 'openai/gpt-5.2-chat'],
   },
   {
-    id: 'anthropic/claude-3.7-sonnet',
-    label: 'Claude 3.7 Sonnet',
+    id: 'anthropic/claude-opus-4.6',
+    label: 'Claude Opus 4.6',
     provider: 'OpenRouter',
     supportsVoice: true,
     isDefault: false,
-    description: 'Strong conversational reasoning with a familiar Claude tone.',
-    latency: 'balanced',
-    fallbackModelIds: ['anthropic/claude-sonnet-4', 'openai/gpt-4.1'],
+    description: 'Deepest confrontational reasoning for the most clinically demanding sessions.',
+    latency: 'deep',
+    fallbackModelIds: ['anthropic/claude-opus-4.5', 'anthropic/claude-sonnet-4.6'],
   },
   {
-    id: 'openai/gpt-4.1',
-    label: 'GPT-4.1',
+    id: 'anthropic/claude-opus-4.5',
+    label: 'Claude Opus 4.5',
     provider: 'OpenRouter',
     supportsVoice: true,
     isDefault: false,
-    description: 'Reliable structured outputs and session summaries.',
+    description: 'Deep reasoning fallback with a forceful, reflective tone when Sonnet is unavailable.',
+    latency: 'deep',
+    fallbackModelIds: ['anthropic/claude-sonnet-4.6', 'openai/gpt-5.2-chat'],
+  },
+  {
+    id: 'openai/gpt-5.2-chat',
+    label: 'GPT-5.2 Chat',
+    provider: 'OpenRouter',
+    supportsVoice: true,
+    isDefault: false,
+    description: 'Reliable structured output model for truth reports and disciplined turn-taking.',
     latency: 'balanced',
-    fallbackModelIds: ['openai/gpt-4.1-mini', 'anthropic/claude-sonnet-4'],
+    fallbackModelIds: ['anthropic/claude-sonnet-4.6', 'google/gemini-2.5-flash'],
   },
   {
     id: 'google/gemini-2.5-flash',
@@ -186,9 +213,9 @@ export const MODEL_CATALOG: ModelOption[] = [
     provider: 'OpenRouter',
     supportsVoice: true,
     isDefault: false,
-    description: 'Lowest-latency fallback for quicker turn handling.',
+    description: 'Fastest low-latency option for aggressive interruption handling and recovery.',
     latency: 'fast',
-    fallbackModelIds: ['openai/gpt-4.1-mini', 'anthropic/claude-sonnet-4'],
+    fallbackModelIds: ['anthropic/claude-sonnet-4.6', 'openai/gpt-5.2-chat'],
   },
 ];
 
@@ -196,5 +223,19 @@ export const getModelOption = (modelId?: string): ModelOption =>
   MODEL_CATALOG.find((model) => model.id === modelId) ??
   MODEL_CATALOG.find((model) => model.isDefault) ??
   MODEL_CATALOG[0];
+
+export const getModelAttemptOrder = (
+  modelId?: string,
+  options?: {
+    preferReportModel?: boolean;
+  },
+): ModelOption[] => {
+  const primaryModel = getModelOption(modelId);
+  const orderedIds = options?.preferReportModel
+    ? [REPORT_MODEL_ID, primaryModel.id, ...primaryModel.fallbackModelIds]
+    : [primaryModel.id, ...primaryModel.fallbackModelIds];
+
+  return [...new Set(orderedIds)].map((id) => getModelOption(id));
+};
 
 export const toObjectIdString = (value: Types.ObjectId | string): string => String(value);

@@ -1,7 +1,11 @@
 import { CoupleModel, type CoupleDocument } from '../domain/Models/Couple.js';
 import { SessionModel, type SessionDocument } from '../domain/Models/Session.js';
 import { UserProfileModel } from '../domain/Models/UserProfile.js';
-import { createInviteCode, getSessionStartBlocker } from '../domain/Rules/sessionRules.js';
+import {
+  createInviteCode,
+  getSessionStartBlocker,
+  isMeaningfulSessionAttempt,
+} from '../domain/Rules/sessionRules.js';
 import {
   DEFAULT_MODEL_ID,
   MODEL_CATALOG,
@@ -12,9 +16,15 @@ import {
   type DashboardResponse,
   type JoinCoupleInput,
   type ModelOption,
+  type SendWorkspaceInviteInput,
   type SessionSummary,
 } from '../domain/Types/mirror.js';
+import { env } from '../infrastructure/Config/env.js';
 import { HttpError } from '../infrastructure/Errors/HttpError.js';
+import {
+  canSendWorkspaceInvitationEmails,
+  sendWorkspaceInvitationEmail,
+} from '../infrastructure/Email/workspaceInviteMailer.js';
 
 const findCoupleByUserId = async (userId: string): Promise<CoupleDocument | null> =>
   CoupleModel.findOne({
@@ -38,6 +48,26 @@ const ensureUserProfile = async (userId: string, input: CreateCoupleInput): Prom
   );
 };
 
+const getPrimaryClientUrl = (): string =>
+  env.CLIENT_URL.split(',')
+    .map((value) => value.trim())
+    .find(Boolean) || 'http://localhost:5173';
+
+const buildInvitationUrl = (
+  path: '/sign-in' | '/sign-up',
+  inviteCode: string,
+  email?: string,
+): string => {
+  const url = new URL(path, getPrimaryClientUrl());
+  url.searchParams.set('invite', inviteCode);
+
+  if (email) {
+    url.searchParams.set('email', email);
+  }
+
+  return url.toString();
+};
+
 const mapCoupleSummary = (couple: CoupleDocument): CoupleSummary => ({
   id: toObjectIdString(couple._id),
   inviteCode: couple.inviteCode,
@@ -56,6 +86,7 @@ const mapCoupleSummary = (couple: CoupleDocument): CoupleSummary => ({
     : undefined,
   memorySummary: couple.memorySummary,
   activeHomeworkGate: couple.activeHomeworkGate ?? null,
+  pendingInvitation: couple.pendingInvitation ?? null,
 });
 
 const mapSessionSummary = (session: SessionDocument): SessionSummary => ({
@@ -64,6 +95,7 @@ const mapSessionSummary = (session: SessionDocument): SessionSummary => ({
   roomName: session.roomName,
   status: session.status,
   selectedModel: session.selectedModel,
+  createdByUserId: session.createdByUserId || '',
   startedAt: session.startedAt?.toISOString() ?? null,
   endedAt: session.endedAt?.toISOString() ?? null,
   report: session.report ?? null,
@@ -71,6 +103,33 @@ const mapSessionSummary = (session: SessionDocument): SessionSummary => ({
   interventions: session.interventions,
   metrics: session.metrics,
 });
+
+const clearStaleHomeworkGateIfNeeded = async (couple: CoupleDocument): Promise<void> => {
+  const gate = couple.activeHomeworkGate;
+  if (!gate) {
+    return;
+  }
+
+  const sourceSession = await SessionModel.findById(gate.sourceSessionId);
+  if (!sourceSession) {
+    couple.activeHomeworkGate = null;
+    await couple.save();
+    return;
+  }
+
+  const isMeaningful = isMeaningfulSessionAttempt({
+    transcriptSegments: sourceSession.transcriptSegments,
+    interventions: sourceSession.interventions,
+    metrics: sourceSession.metrics,
+  });
+
+  if (isMeaningful) {
+    return;
+  }
+
+  couple.activeHomeworkGate = null;
+  await couple.save();
+};
 
 export class CoupleApplication {
   static async createCouple(userId: string, input: CreateCoupleInput): Promise<CoupleSummary> {
@@ -90,6 +149,7 @@ export class CoupleApplication {
       preferredModel: DEFAULT_MODEL_ID,
       memorySummary: '',
       activeHomeworkGate: null,
+      pendingInvitation: null,
     });
 
     return mapCoupleSummary(couple);
@@ -118,6 +178,63 @@ export class CoupleApplication {
     couple.partnerBName = input.displayName || 'Partner B';
     couple.partnerBEmail = input.email;
     couple.partnerBAvatarUrl = input.avatarUrl;
+    couple.pendingInvitation = null;
+    await couple.save();
+
+    return mapCoupleSummary(couple);
+  }
+
+  static async sendWorkspaceInvite(
+    userId: string,
+    input: SendWorkspaceInviteInput,
+  ): Promise<CoupleSummary> {
+    const couple = await findCoupleByUserId(userId);
+    if (!couple) {
+      throw new HttpError(404, 'Create a couple workspace before sending an invitation.');
+    }
+
+    if (couple.partnerBUserId) {
+      throw new HttpError(409, 'Both partners are already connected to this workspace.');
+    }
+
+    if (!canSendWorkspaceInvitationEmails()) {
+      throw new HttpError(
+        500,
+        'SMTP invite email is not configured on the backend. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and SMTP_FROM.',
+      );
+    }
+
+    const email = input.email?.trim().toLowerCase();
+    if (!email) {
+      throw new HttpError(400, 'Invitation email is required.');
+    }
+
+    if (couple.partnerAEmail?.trim().toLowerCase() === email) {
+      throw new HttpError(400, "Use your partner's email address for the invitation.");
+    }
+
+    const inviterName =
+      couple.partnerAUserId === userId ? couple.partnerAName : couple.partnerBName || couple.partnerAName;
+    const recipientName = input.recipientName?.trim() || undefined;
+    const signUpUrl = buildInvitationUrl('/sign-up', couple.inviteCode, email);
+    const signInUrl = buildInvitationUrl('/sign-in', couple.inviteCode, email);
+
+    await sendWorkspaceInvitationEmail({
+      toEmail: email,
+      recipientName,
+      inviterName,
+      inviteCode: couple.inviteCode,
+      signUpUrl,
+      signInUrl,
+    });
+
+    couple.pendingInvitation = {
+      email,
+      recipientName,
+      invitedByUserId: userId,
+      invitedByName: inviterName,
+      sentAt: new Date(),
+    };
     await couple.save();
 
     return mapCoupleSummary(couple);
@@ -136,6 +253,72 @@ export class CoupleApplication {
     return model;
   }
 
+  static async removePartner(userId: string): Promise<CoupleSummary> {
+    const couple = await findCoupleByUserId(userId);
+    if (!couple) {
+      throw new HttpError(404, 'Couple workspace not found.');
+    }
+    if (couple.partnerAUserId !== userId) {
+      throw new HttpError(403, 'Only the partner who created the workspace can remove the second partner.');
+    }
+    if (!couple.partnerBUserId) {
+      throw new HttpError(409, 'There is no second partner attached to this workspace.');
+    }
+
+    couple.partnerBUserId = undefined;
+    couple.partnerBName = undefined;
+    couple.partnerBEmail = undefined;
+    couple.partnerBAvatarUrl = undefined;
+    couple.activeHomeworkGate = null;
+    couple.pendingInvitation = null;
+    couple.inviteCode = createInviteCode();
+    await couple.save();
+
+    return mapCoupleSummary(couple);
+  }
+
+  static async leaveWorkspace(userId: string): Promise<{ leftWorkspace: true }> {
+    const couple = await findCoupleByUserId(userId);
+    if (!couple) {
+      throw new HttpError(404, 'Couple workspace not found.');
+    }
+
+    if (couple.partnerBUserId === userId) {
+      couple.partnerBUserId = undefined;
+      couple.partnerBName = undefined;
+      couple.partnerBEmail = undefined;
+      couple.partnerBAvatarUrl = undefined;
+      couple.activeHomeworkGate = null;
+      couple.pendingInvitation = null;
+      couple.inviteCode = createInviteCode();
+      await couple.save();
+      return { leftWorkspace: true };
+    }
+
+    if (couple.partnerAUserId !== userId) {
+      throw new HttpError(403, 'You are not attached to this workspace.');
+    }
+
+    if (couple.partnerBUserId) {
+      couple.partnerAUserId = couple.partnerBUserId;
+      couple.partnerAName = couple.partnerBName || 'Partner A';
+      couple.partnerAEmail = couple.partnerBEmail;
+      couple.partnerAAvatarUrl = couple.partnerBAvatarUrl;
+      couple.partnerBUserId = undefined;
+      couple.partnerBName = undefined;
+      couple.partnerBEmail = undefined;
+      couple.partnerBAvatarUrl = undefined;
+      couple.activeHomeworkGate = null;
+      couple.pendingInvitation = null;
+      couple.inviteCode = createInviteCode();
+      await couple.save();
+      return { leftWorkspace: true };
+    }
+
+    await CoupleModel.deleteOne({ _id: couple._id });
+    return { leftWorkspace: true };
+  }
+
   static async getDashboard(userId: string): Promise<DashboardResponse> {
     const couple = await findCoupleByUserId(userId);
 
@@ -149,7 +332,12 @@ export class CoupleApplication {
       };
     }
 
+    await clearStaleHomeworkGateIfNeeded(couple);
+
     const sessions = await SessionModel.find({ coupleId: couple._id }).sort({ createdAt: -1 }).limit(12);
+    const activeSession = sessions.find(
+      (s) => s.status === 'pending' || s.status === 'live',
+    ) ?? null;
     const blockerReason =
       !couple.partnerBUserId
         ? 'Invite the second partner before opening the room.'
@@ -161,6 +349,7 @@ export class CoupleApplication {
       models: MODEL_CATALOG,
       canStartSession: !blockerReason,
       blockerReason: blockerReason ?? undefined,
+      activeSession: activeSession ? mapSessionSummary(activeSession) : null,
     };
   }
 }

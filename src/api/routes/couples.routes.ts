@@ -23,11 +23,38 @@ couplesRouter.post(
   }),
 );
 
+couplesRouter.post(
+  '/invitations',
+  asyncHandler(async (request, response) => {
+    const userId = getAuthenticatedUserId(request);
+    const couple = await CoupleApplication.sendWorkspaceInvite(userId, request.body ?? {});
+    response.json(couple);
+  }),
+);
+
 couplesRouter.patch(
   '/preferences',
   asyncHandler(async (request, response) => {
     const userId = getAuthenticatedUserId(request);
     const model = await CoupleApplication.updatePreferredModel(userId, request.body?.modelId);
     response.json(model);
+  }),
+);
+
+couplesRouter.delete(
+  '/partner',
+  asyncHandler(async (request, response) => {
+    const userId = getAuthenticatedUserId(request);
+    const couple = await CoupleApplication.removePartner(userId);
+    response.json(couple);
+  }),
+);
+
+couplesRouter.post(
+  '/leave',
+  asyncHandler(async (request, response) => {
+    const userId = getAuthenticatedUserId(request);
+    const result = await CoupleApplication.leaveWorkspace(userId);
+    response.json(result);
   }),
 );

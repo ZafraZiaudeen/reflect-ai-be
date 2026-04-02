@@ -8,9 +8,10 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "agent:dev": "tsx src/Infrastructure/Voice/mirrorAgent.runner.ts dev",
-    "agent:start": "node dist/Infrastructure/Voice/mirrorAgent.runner.js start",
-    "agent:connect": "tsx src/Infrastructure/Voice/mirrorAgent.runner.ts connect"
+    "agent:dev": "tsx src/infrastructure/Voice/mirrorAgent.runner.ts dev",
+    "agent:start": "node dist/infrastructure/Voice/mirrorAgent.runner.js start",
+    "agent:connect": "tsx src/infrastructure/Voice/mirrorAgent.runner.ts connect",
+    "postinstall": "patch-package"
   },
   "author": "",
   "license": "ISC",
@@ -23,12 +24,16 @@
     "express": "^5.2.1",
     "livekit-server-sdk": "^2.15.0",
     "mongoose": "^9.3.3",
+    "nodemailer": "^8.0.4",
     "nodemon": "^3.1.14",
+    "ws": "^8.20.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
+    "@types/ws": "^8.18.1",
+    "patch-package": "^8.0.1",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"

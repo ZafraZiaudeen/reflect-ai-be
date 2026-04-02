@@ -3,6 +3,7 @@ import type {
   HomeworkAssignment,
   HomeworkGate,
   InterventionEvent,
+  SessionMetrics,
   TranscriptSegment,
   TruthReport,
 } from '../Types/mirror.js';
@@ -163,4 +164,38 @@ export const buildSessionContextSummary = (
   }
 
   return `Memory summary: ${previousSummary}. Current gate: ${gateSummary}`;
+};
+
+const countWords = (value: string): number =>
+  value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+
+export const isMeaningfulSessionAttempt = (args: {
+  transcriptSegments: TranscriptSegment[];
+  interventions: InterventionEvent[];
+  metrics: SessionMetrics;
+}): boolean => {
+  const conversationalTurns = args.transcriptSegments.filter((segment) => segment.source !== 'system');
+  const partnerTurns = conversationalTurns.filter(
+    (segment) => segment.source === 'frontend-webspeech' || segment.source === 'livekit-user',
+  );
+  const mirrorTurns = conversationalTurns.filter((segment) => segment.source === 'agent-livekit');
+  const partnerWordCount = partnerTurns.reduce((total, segment) => total + countWords(segment.text), 0);
+  const totalWordCount = conversationalTurns.reduce((total, segment) => total + countWords(segment.text), 0);
+
+  if (partnerTurns.length >= 2 && totalWordCount >= 24) {
+    return true;
+  }
+
+  if (partnerTurns.length >= 1 && mirrorTurns.length >= 1 && totalWordCount >= 18) {
+    return true;
+  }
+
+  if (args.interventions.length >= 2 && partnerWordCount >= 12) {
+    return true;
+  }
+
+  return false;
 };

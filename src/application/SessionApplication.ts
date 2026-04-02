@@ -3,6 +3,7 @@ import { SessionModel, type SessionDocument } from '../domain/Models/Session.js'
 import {
   buildSessionContextSummary,
   getSessionStartBlocker,
+  isMeaningfulSessionAttempt,
 } from '../domain/Rules/sessionRules.js';
 import {
   getModelOption,
@@ -25,6 +26,7 @@ const mapSessionSummary = (session: SessionDocument): SessionSummary => ({
   roomName: session.roomName,
   status: session.status,
   selectedModel: session.selectedModel,
+  createdByUserId: session.createdByUserId || '',
   startedAt: session.startedAt?.toISOString() ?? null,
   endedAt: session.endedAt?.toISOString() ?? null,
   report: session.report ?? null,
@@ -53,6 +55,33 @@ const resolveSpeaker = (couple: CoupleDocument, userId: string) => {
 
 const createRoomName = (coupleId: string): string => `mirror-${coupleId}-${Date.now()}`;
 
+const clearStaleHomeworkGateIfNeeded = async (couple: CoupleDocument): Promise<void> => {
+  const gate = couple.activeHomeworkGate;
+  if (!gate) {
+    return;
+  }
+
+  const sourceSession = await SessionModel.findById(gate.sourceSessionId);
+  if (!sourceSession) {
+    couple.activeHomeworkGate = null;
+    await couple.save();
+    return;
+  }
+
+  const isMeaningful = isMeaningfulSessionAttempt({
+    transcriptSegments: sourceSession.transcriptSegments,
+    interventions: sourceSession.interventions,
+    metrics: sourceSession.metrics,
+  });
+
+  if (isMeaningful) {
+    return;
+  }
+
+  couple.activeHomeworkGate = null;
+  await couple.save();
+};
+
 export class SessionApplication {
   static async createSession(userId: string, selectedModel?: string): Promise<SessionSummary> {
     const couple = await findCoupleByUserId(userId);
@@ -62,6 +91,8 @@ export class SessionApplication {
     if (!couple.partnerBUserId) {
       throw new HttpError(409, 'Both partners must join before a session can start.');
     }
+
+    await clearStaleHomeworkGateIfNeeded(couple);
 
     const blockerReason = getSessionStartBlocker(couple.activeHomeworkGate);
     if (blockerReason) {
@@ -77,6 +108,7 @@ export class SessionApplication {
       roomName: createRoomName(toObjectIdString(couple._id)),
       status: 'pending',
       selectedModel: model.id,
+      createdByUserId: userId,
       openingContext: buildSessionContextSummary(couple.memorySummary, couple.activeHomeworkGate),
       transcriptSegments: [],
       interventions: [],
@@ -197,6 +229,31 @@ export class SessionApplication {
       throw new HttpError(404, 'Session not found.');
     }
 
+    const isMeaningful = isMeaningfulSessionAttempt({
+      transcriptSegments: session.transcriptSegments,
+      interventions: session.interventions,
+      metrics: session.metrics,
+    });
+
+    if (!isMeaningful) {
+      session.report = null;
+      session.endedAt = session.endedAt ?? new Date();
+      session.startedAt = session.startedAt ?? session.createdAt;
+      session.metrics.durationMs = Math.max(0, session.endedAt.getTime() - session.startedAt.getTime());
+      session.metrics.honestyScore = 0;
+      session.status = 'interrupted';
+      session.liveKitDispatchId = undefined;
+      session.agentDispatchRequestedAt = undefined;
+      await session.save();
+
+      if (couple.activeHomeworkGate?.sourceSessionId === toObjectIdString(session._id)) {
+        couple.activeHomeworkGate = null;
+        await couple.save();
+      }
+
+      return mapSessionSummary(session);
+    }
+
     if (!session.report) {
       const report = await generateTruthReport({
         selectedModel: session.selectedModel,
@@ -211,6 +268,8 @@ export class SessionApplication {
       session.startedAt = session.startedAt ?? session.createdAt;
       session.metrics.durationMs = Math.max(0, session.endedAt.getTime() - session.startedAt.getTime());
       session.status = session.status === 'interrupted' ? 'interrupted' : 'completed';
+      session.liveKitDispatchId = undefined;
+      session.agentDispatchRequestedAt = undefined;
       await session.save();
 
       couple.memorySummary = report.truthSummary;
@@ -242,14 +301,26 @@ export class SessionApplication {
       couple.activeHomeworkGate?.assignments.map((assignment) => assignment.title).join(' | ') ||
       'No pending homework gate.';
 
-    return {
+    const metadata: Record<string, string> = {
       sessionId: toObjectIdString(session._id),
       coupleId: toObjectIdString(couple._id),
       selectedModel: session.selectedModel,
       openingContext: session.openingContext,
       gateSummary,
+      partnerAUserId: couple.partnerAUserId,
       partnerAName: couple.partnerAName,
       partnerBName: couple.partnerBName || 'Partner B',
     };
+
+    if (couple.partnerBUserId) {
+      metadata.partnerBUserId = couple.partnerBUserId;
+    }
+
+    const homeworkTitle = couple.activeHomeworkGate?.assignments[0]?.title;
+    if (homeworkTitle) {
+      metadata.homeworkTitle = homeworkTitle;
+    }
+
+    return metadata;
   }
 }

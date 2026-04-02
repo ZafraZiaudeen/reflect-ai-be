@@ -14,6 +14,8 @@ import {
 } from '../domain/Types/mirror.js';
 import { HttpError } from '../infrastructure/Errors/HttpError.js';
 import { generateTruthReport } from '../infrastructure/OpenRouter/openRouterService.js';
+import { MemoryApplication } from './MemoryApplication.js';
+import { analyzeSessionHonesty } from '../infrastructure/Embeddings/embeddingService.js';
 
 const findCoupleByUserId = async (userId: string): Promise<CoupleDocument | null> =>
   CoupleModel.findOne({
@@ -103,13 +105,26 @@ export class SessionApplication {
     couple.preferredModel = model.id;
     await couple.save();
 
+    // Build enriched opening context using vector memory (all past reflections + sessions)
+    let openingContext: string;
+    try {
+      openingContext = await MemoryApplication.buildEnrichedOpeningContext({
+        coupleId: toObjectIdString(couple._id),
+        couple,
+        previousSummary: couple.memorySummary,
+      });
+    } catch (error) {
+      console.warn('[session] Failed to build enriched context, falling back to basic:', error);
+      openingContext = buildSessionContextSummary(couple.memorySummary, couple.activeHomeworkGate);
+    }
+
     const session = await SessionModel.create({
       coupleId: couple._id,
       roomName: createRoomName(toObjectIdString(couple._id)),
       status: 'pending',
       selectedModel: model.id,
       createdByUserId: userId,
-      openingContext: buildSessionContextSummary(couple.memorySummary, couple.activeHomeworkGate),
+      openingContext,
       transcriptSegments: [],
       interventions: [],
       metrics: {
@@ -215,6 +230,23 @@ export class SessionApplication {
     gate.unlockedAt = everyAssignmentCovered ? new Date() : null;
 
     await couple.save();
+
+    // Store reflection in vector memory for future sessions
+    const isPartnerA = couple.partnerAUserId === userId;
+    void MemoryApplication.storeReflection({
+      coupleId: toObjectIdString(couple._id),
+      sessionId,
+      userId,
+      partnerRole: isPartnerA ? 'partner_a' : 'partner_b',
+      partnerName: isPartnerA ? couple.partnerAName : (couple.partnerBName || 'Partner B'),
+      assignmentTitle: assignment.title,
+      reflectionPrompt: assignment.reflectionPrompt,
+      reflectionText: input.reflection.trim(),
+      sessionSummary: couple.memorySummary,
+    }).catch((error) => {
+      console.warn('[session] Failed to store reflection in vector memory:', error);
+    });
+
     return couple;
   }
 
@@ -255,15 +287,45 @@ export class SessionApplication {
     }
 
     if (!session.report) {
+      // Get reflection history for dynamic homework generation
+      let reflectionHistory = '';
+      try {
+        reflectionHistory = await MemoryApplication.buildReflectionContext({
+          coupleId: toObjectIdString(couple._id),
+          couple,
+        });
+      } catch {
+        // Non-critical — report generation works without reflection history
+      }
+
       const report = await generateTruthReport({
         selectedModel: session.selectedModel,
         transcriptSegments: session.transcriptSegments,
         interventions: session.interventions,
         previousSummary: couple.memorySummary,
+        reflectionHistory,
       });
 
+      // Validate and improve honesty score with HuggingFace analysis
+      let finalHonestyScore = report.honestyScore;
+      try {
+        const partnerUtterances = session.transcriptSegments
+          .filter((s) => s.source === 'livekit-user' || s.source === 'frontend-webspeech')
+          .map((s) => ({ speaker: s.speakerLabel, text: s.text }));
+
+        if (partnerUtterances.length >= 3) {
+          const hfAnalysis = await analyzeSessionHonesty(partnerUtterances);
+          // Combine LLM score (60% weight) with HuggingFace score (40% weight)
+          finalHonestyScore = Math.round(report.honestyScore * 0.6 + hfAnalysis.score * 0.4);
+          finalHonestyScore = Math.max(1, Math.min(100, finalHonestyScore));
+        }
+      } catch (error) {
+        console.warn('[session] HuggingFace honesty analysis failed, using LLM score only:', error);
+      }
+
+      report.honestyScore = finalHonestyScore;
       session.report = report;
-      session.metrics.honestyScore = report.honestyScore;
+      session.metrics.honestyScore = finalHonestyScore;
       session.endedAt = session.endedAt ?? new Date();
       session.startedAt = session.startedAt ?? session.createdAt;
       session.metrics.durationMs = Math.max(0, session.endedAt.getTime() - session.startedAt.getTime());
@@ -284,6 +346,17 @@ export class SessionApplication {
         })),
       };
       await couple.save();
+
+      // Store session summary in vector memory for future retrieval
+      void MemoryApplication.storeSessionSummary({
+        coupleId: toObjectIdString(couple._id),
+        sessionId: toObjectIdString(session._id),
+        truthSummary: report.truthSummary,
+        coreConflict: report.coreConflict,
+        observedPatterns: report.observedPatterns,
+      }).catch((error) => {
+        console.warn('[session] Failed to store session summary in vector memory:', error);
+      });
     }
 
     return mapSessionSummary(session);
@@ -319,6 +392,13 @@ export class SessionApplication {
     const homeworkTitle = couple.activeHomeworkGate?.assignments[0]?.title;
     if (homeworkTitle) {
       metadata.homeworkTitle = homeworkTitle;
+    }
+
+    // Include reflection context for the AI to discuss
+    const reflectionContext = MemoryApplication.buildCurrentReflectionsForDiscussion(couple);
+    if (reflectionContext) {
+      metadata.reflectionContext = reflectionContext;
+      metadata.hasReflections = 'true';
     }
 
     return metadata;

@@ -121,11 +121,13 @@ export const generateTruthReport = async ({
   transcriptSegments,
   interventions,
   previousSummary,
+  reflectionHistory,
 }: {
   selectedModel: string;
   transcriptSegments: TranscriptSegment[];
   interventions: InterventionEvent[];
   previousSummary: string;
+  reflectionHistory?: string;
 }): Promise<TruthReport> => {
   if (!env.OPENROUTER_API_KEY) {
     return normalizeTruthReport({}, transcriptSegments, interventions, previousSummary);
@@ -134,6 +136,41 @@ export const generateTruthReport = async ({
   const client = createOpenRouterClient({
     defaultMaxTokens: REPORT_MAX_COMPLETION_TOKENS,
   });
+
+  const systemPrompt = [
+    'You generate direct but professional couples-session truth reports.',
+    'Analyze the transcript for Gottman Four Horsemen patterns (Criticism, Contempt, Defensiveness, Stonewalling).',
+    'Score honesty from 1-100 based on accountability, denial, deflection, and genuine engagement observed.',
+    '',
+    'CRITICAL — DYNAMIC HOMEWORK GENERATION:',
+    'The "homework" array MUST contain 2 assignments with reflection prompts that are SPECIFIC to what happened in THIS session.',
+    'Do NOT use generic prompts. Reference specific moments, quotes, patterns, or conflicts from the transcript.',
+    'Each reflectionPrompt should ask the partner to reflect on something SPECIFIC they said or did in this session.',
+    'The prompts should build on previous sessions and push for deeper accountability and progress.',
+    'Example good prompt: "You said \'I never ignore you\' but your partner described three specific incidents. Write about why you minimized those moments."',
+    'Example bad prompt: "What part of this conflict are you still minimizing?" (too generic)',
+    '',
+    'If reflection history from previous sessions is provided, reference patterns of growth or stagnation.',
+    'The homework should feel like a natural continuation of the conversation, not a worksheet.',
+    '',
+    'Avoid abuse, diagnosis, or threats. Return only valid JSON.',
+  ].join('\n');
+
+  const userPayload: Record<string, unknown> = {
+    previousSummary,
+    interventions,
+    transcriptSegments: transcriptSegments.map((segment) => ({
+      speakerRole: segment.speakerRole,
+      speakerLabel: segment.speakerLabel,
+      text: segment.text,
+      createdAt: segment.createdAt,
+      source: segment.source,
+    })),
+  };
+
+  if (reflectionHistory) {
+    userPayload.reflectionHistory = reflectionHistory;
+  }
 
   for (const model of getModelAttemptOrder(selectedModel, { preferReportModel: true })) {
     try {
@@ -152,26 +189,11 @@ export const generateTruthReport = async ({
         messages: [
           {
             role: 'system',
-            content:
-              'You generate direct but professional couples-session truth reports. Avoid abuse, diagnosis, or threats. Return only valid JSON.',
+            content: systemPrompt,
           },
           {
             role: 'user',
-            content: JSON.stringify(
-              {
-                previousSummary,
-                interventions,
-                transcriptSegments: transcriptSegments.map((segment) => ({
-                  speakerRole: segment.speakerRole,
-                  speakerLabel: segment.speakerLabel,
-                  text: segment.text,
-                  createdAt: segment.createdAt,
-                  source: segment.source,
-                })),
-              },
-              null,
-              2,
-            ),
+            content: JSON.stringify(userPayload, null, 2),
           },
         ],
       } as never)) as {

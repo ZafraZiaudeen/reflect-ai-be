@@ -160,6 +160,17 @@ export class VoiceTelemetryApplication {
     });
   }
 
+  static async updateHonestyScore(sessionId: string, honestyScore: number): Promise<void> {
+    const clampedScore = Math.max(1, Math.min(100, Math.round(honestyScore)));
+    await runTelemetryMutation('updateHonestyScore', async () => {
+      await SessionModel.findByIdAndUpdate(sessionId, {
+        $set: {
+          'metrics.honestyScore': clampedScore,
+        },
+      });
+    });
+  }
+
   static async markInterrupted(sessionId: string, reason: string): Promise<void> {
     await runTelemetryMutation('markInterrupted', async () => {
       await SessionModel.findByIdAndUpdate(sessionId, {

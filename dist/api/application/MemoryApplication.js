@@ -2,6 +2,16 @@ import { Types } from 'mongoose';
 import { ReflectionMemoryModel, } from '../domain/Models/ReflectionMemory.js';
 import { generateEmbedding, cosineSimilarity } from '../infrastructure/Embeddings/embeddingService.js';
 import { toObjectIdString } from '../domain/Types/mirror.js';
+const summarizeInline = (text, maxLength = 100) => {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+        return 'No reflection submitted.';
+    }
+    if (normalized.length <= maxLength) {
+        return normalized;
+    }
+    return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+};
 /* ------------------------------------------------------------------ */
 /*  Store reflections with embeddings                                   */
 /* ------------------------------------------------------------------ */
@@ -17,6 +27,7 @@ export class MemoryApplication {
             // Count existing reflections to determine session number
             const existingCount = await ReflectionMemoryModel.countDocuments({
                 coupleId: new Types.ObjectId(args.coupleId),
+                memoryType: 'reflection',
                 userId: { $ne: 'system' },
             });
             const sessionNumber = Math.floor(existingCount / 2) + 1;
@@ -24,21 +35,26 @@ export class MemoryApplication {
             await ReflectionMemoryModel.findOneAndUpdate({
                 coupleId: new Types.ObjectId(args.coupleId),
                 sessionId: new Types.ObjectId(args.sessionId),
+                memoryType: 'reflection',
                 userId: args.userId,
                 assignmentTitle: args.assignmentTitle,
             }, {
                 $set: {
+                    memoryType: 'reflection',
                     partnerRole: args.partnerRole,
                     partnerName: args.partnerName,
                     reflectionPrompt: args.reflectionPrompt,
                     reflectionText: args.reflectionText,
                     sessionSummary: args.sessionSummary || '',
-                    embedding,
+                    embedding: embedding.vector,
+                    embeddingProvider: embedding.provider,
+                    embeddingFallback: embedding.fallbackUsed,
                     sessionNumber,
                 },
                 $setOnInsert: {
                     coupleId: new Types.ObjectId(args.coupleId),
                     sessionId: new Types.ObjectId(args.sessionId),
+                    memoryType: 'reflection',
                     userId: args.userId,
                     assignmentTitle: args.assignmentTitle,
                 },
@@ -63,21 +79,26 @@ export class MemoryApplication {
             await ReflectionMemoryModel.findOneAndUpdate({
                 coupleId: new Types.ObjectId(args.coupleId),
                 sessionId: new Types.ObjectId(args.sessionId),
+                memoryType: 'session_summary',
                 userId: 'system',
                 assignmentTitle: 'Session Summary',
             }, {
                 $set: {
+                    memoryType: 'session_summary',
                     partnerRole: 'system',
                     partnerName: 'Mirror',
                     reflectionPrompt: 'session-summary',
                     reflectionText: summaryText,
                     sessionSummary: args.truthSummary,
-                    embedding,
+                    embedding: embedding.vector,
+                    embeddingProvider: embedding.provider,
+                    embeddingFallback: embedding.fallbackUsed,
                     sessionNumber: 0,
                 },
                 $setOnInsert: {
                     coupleId: new Types.ObjectId(args.coupleId),
                     sessionId: new Types.ObjectId(args.sessionId),
+                    memoryType: 'session_summary',
                     userId: 'system',
                     assignmentTitle: 'Session Summary',
                 },
@@ -85,6 +106,41 @@ export class MemoryApplication {
         }
         catch (error) {
             console.warn('[memory] Failed to store session summary embedding:', error);
+        }
+    }
+    static async storeConversationDigest(args) {
+        try {
+            const embedding = await generateEmbedding(args.digestText);
+            await ReflectionMemoryModel.findOneAndUpdate({
+                coupleId: new Types.ObjectId(args.coupleId),
+                sessionId: new Types.ObjectId(args.sessionId),
+                memoryType: 'conversation_digest',
+                userId: 'system',
+                assignmentTitle: 'Conversation Digest',
+            }, {
+                $set: {
+                    memoryType: 'conversation_digest',
+                    partnerRole: 'system',
+                    partnerName: 'Mirror',
+                    reflectionPrompt: 'conversation-digest',
+                    reflectionText: args.digestText,
+                    sessionSummary: args.sessionSummary || '',
+                    embedding: embedding.vector,
+                    embeddingProvider: embedding.provider,
+                    embeddingFallback: embedding.fallbackUsed,
+                    sessionNumber: 0,
+                },
+                $setOnInsert: {
+                    coupleId: new Types.ObjectId(args.coupleId),
+                    sessionId: new Types.ObjectId(args.sessionId),
+                    memoryType: 'conversation_digest',
+                    userId: 'system',
+                    assignmentTitle: 'Conversation Digest',
+                },
+            }, { upsert: true });
+        }
+        catch (error) {
+            console.warn('[memory] Failed to store conversation digest embedding:', error);
         }
     }
     /* ------------------------------------------------------------------ */
@@ -97,6 +153,7 @@ export class MemoryApplication {
     static async getAllReflections(coupleId) {
         return ReflectionMemoryModel.find({
             coupleId: new Types.ObjectId(coupleId),
+            memoryType: 'reflection',
             userId: { $ne: 'system' },
         })
             .sort({ createdAt: 1 })
@@ -108,9 +165,20 @@ export class MemoryApplication {
     static async getAllSessionSummaries(coupleId) {
         return ReflectionMemoryModel.find({
             coupleId: new Types.ObjectId(coupleId),
+            memoryType: 'session_summary',
             userId: 'system',
         })
             .sort({ createdAt: 1 })
+            .exec();
+    }
+    static async getRecentConversationDigests(coupleId, limit = 4) {
+        return ReflectionMemoryModel.find({
+            coupleId: new Types.ObjectId(coupleId),
+            memoryType: 'conversation_digest',
+            userId: 'system',
+        })
+            .sort({ createdAt: -1 })
+            .limit(limit)
             .exec();
     }
     /**
@@ -127,7 +195,7 @@ export class MemoryApplication {
                     $vectorSearch: {
                         index: 'reflection_vector_index',
                         path: 'embedding',
-                        queryVector: queryEmbedding,
+                        queryVector: queryEmbedding.vector,
                         numCandidates: limit * 10,
                         limit,
                         filter: {
@@ -156,7 +224,7 @@ export class MemoryApplication {
             .filter((mem) => mem.embedding && mem.embedding.length > 0 && mem.embedding.some((v) => v !== 0))
             .map((mem) => {
             const doc = mem.toObject();
-            doc.similarity = cosineSimilarity(queryEmbedding, mem.embedding);
+            doc.similarity = cosineSimilarity(queryEmbedding.vector, mem.embedding);
             return doc;
         })
             .sort((a, b) => b.similarity - a.similarity)
@@ -253,6 +321,45 @@ export class MemoryApplication {
         }
         return parts.join('\n');
     }
+    static buildReflectionOpeningLine(couple, options) {
+        const gate = couple.activeHomeworkGate;
+        if (!gate || gate.assignments.length === 0) {
+            return '';
+        }
+        const describePartner = (partnerRole, partnerName, userId) => {
+            if (!userId) {
+                return '';
+            }
+            const partnerAssignments = gate.assignments.slice(0, 2).map((assignment) => {
+                const reflection = assignment.reflections.find((entry) => entry.userId === userId);
+                if (!reflection?.reflection.trim()) {
+                    return `${assignment.title}: no reflection submitted`;
+                }
+                return `${assignment.title}: "${summarizeInline(reflection.reflection, 88)}"`;
+            });
+            if (partnerAssignments.length === 0) {
+                return `${partnerName}, there is no saved homework from you yet.`;
+            }
+            const prefix = partnerRole === 'partner_a' ? `${partnerName}, you wrote` : `${partnerName}, you wrote`;
+            return `${prefix} ${partnerAssignments.join('; ')}.`;
+        };
+        const partnerALine = describePartner('partner_a', couple.partnerAName, couple.partnerAUserId);
+        const partnerBLine = describePartner('partner_b', couple.partnerBName || 'Partner B', couple.partnerBUserId);
+        if (options?.presentPartnerRole === 'partner_a') {
+            return `${partnerALine} We start there, and we wait for ${couple.partnerBName || 'your partner'} before we move on.`;
+        }
+        if (options?.presentPartnerRole === 'partner_b') {
+            return `${partnerBLine} We start there, and we wait for ${couple.partnerAName} before we move on.`;
+        }
+        return [
+            'We are starting with the homework, not avoiding it.',
+            partnerALine,
+            partnerBLine,
+            'We are going to test whether those words are real in this room.',
+        ]
+            .filter(Boolean)
+            .join(' ');
+    }
     /**
      * Build the enriched opening context for a new session.
      * Combines: previous summary + ALL past reflections + session summaries +
@@ -274,6 +381,15 @@ export class MemoryApplication {
             parts.push('=== ALL PAST SESSION SUMMARIES ===');
             for (let i = 0; i < sessionSummaries.length; i++) {
                 parts.push(`Session ${i + 1}: ${sessionSummaries[i].reflectionText}`);
+            }
+        }
+        const conversationDigests = await this.getRecentConversationDigests(args.coupleId);
+        if (conversationDigests.length > 0) {
+            parts.push('');
+            parts.push('=== RECENT CONVERSATION DIGESTS ===');
+            for (const digest of conversationDigests.reverse()) {
+                parts.push(digest.reflectionText);
+                parts.push('');
             }
         }
         // Complete reflection history

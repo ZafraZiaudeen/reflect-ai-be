@@ -6,14 +6,53 @@ import { env } from '../../infrastructure/Config/env.js';
 import { connectDatabase } from '../../infrastructure/Database/connectDatabase.js';
 import { errorMiddleware } from '../../infrastructure/Http/errorMiddleware.js';
 
+const normalizeOrigin = (origin: string): string => {
+  const trimmed = origin.trim();
+
+  if (!trimmed) {
+    return '';
+  }
+
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return trimmed.replace(/\/+$/, '');
+  }
+};
+
 const allowedOrigins = Array.from(
   new Set(
     [
-      ...env.CLIENT_URL.split(',').map((origin) => origin.trim()),
+      ...env.CLIENT_URL.split(',').map(normalizeOrigin),
       'http://localhost:5173',
     ].filter(Boolean),
   ),
 );
+
+const isAllowedOrigin = (origin: string | undefined): boolean => {
+  if (!origin) {
+    return true;
+  }
+
+  return allowedOrigins.includes(normalizeOrigin(origin));
+};
+
+const corsOptions = {
+  origin: (
+    origin: string | undefined,
+    callback: (error: Error | null, allow?: boolean) => void,
+  ) => {
+    if (isAllowedOrigin(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    console.warn(`[cors] Blocked origin: ${origin}`);
+    callback(null, false);
+  },
+  credentials: true,
+  optionsSuccessStatus: 204,
+};
 
 export const createApiApp = (
   options?: {
@@ -33,22 +72,8 @@ export const createApiApp = (
     });
   }
 
-  app.use(
-    cors({
-      origin: (
-        origin: string | undefined,
-        callback: (error: Error | null, allow?: boolean) => void,
-      ) => {
-        if (!origin || allowedOrigins.includes(origin)) {
-          callback(null, true);
-          return;
-        }
-
-        callback(new Error(`CORS blocked for origin: ${origin}`));
-      },
-      credentials: true,
-    }),
-  );
+  app.use(cors(corsOptions));
+  app.options(/.*/, cors(corsOptions));
   app.use(express.json({ limit: '1mb' }));
   app.use(authenticationMiddleware);
 

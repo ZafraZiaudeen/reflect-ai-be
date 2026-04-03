@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import OpenAI from 'openai';
 import { SessionModel } from '../../domain/Models/Session.js';
 import { CoupleModel } from '../../domain/Models/Couple.js';
+import { getModelAttemptOrder } from '../../domain/Types/mirror.js';
 import { env } from '../Config/env.js';
 import { MemoryApplication } from '../../application/MemoryApplication.js';
+import { createOpenRouterClient } from '../OpenRouter/openRouterService.js';
+import { markVoiceWebSocketAttached } from '../Runtime/runtimeStatus.js';
 /* ------------------------------------------------------------------ */
 /*  Deepgram endpoints                                                 */
 /* ------------------------------------------------------------------ */
@@ -15,7 +17,6 @@ const DEEPGRAM_TTS_URL = 'https://api.deepgram.com/v1/speak?model=aura-2-thalia-
 /* ------------------------------------------------------------------ */
 /*  LLM config                                                         */
 /* ------------------------------------------------------------------ */
-const LLM_MODEL = 'google/gemini-2.5-flash';
 const LLM_MAX_TOKENS = 300;
 const LLM_TEMPERATURE = 0.42;
 /* ------------------------------------------------------------------ */
@@ -283,22 +284,53 @@ const analyzeUtterance = (room, text, speakerName) => {
     return { honestyDelta, escalationDelta, detectedPatterns, intervention };
 };
 const clampScore = (value, min, max) => Math.max(min, Math.min(max, Math.round(value)));
+const persistRoomHonesty = (room) => {
+    void SessionModel.findByIdAndUpdate(room.sessionId, {
+        $set: {
+            'metrics.honestyScore': room.honestyScore,
+        },
+    }).catch((error) => {
+        console.warn('[voice-ws] Failed to persist honesty score:', error);
+    });
+};
+const queueReflectionKickoff = (room) => {
+    if (!room.hasReflections || room.reflectionKickoffDelivered) {
+        return;
+    }
+    room.reflectionKickoffDelivered = true;
+    room.chatHistory.push({
+        role: 'system',
+        content: [
+            'REFLECTION REVIEW IS ACTIVE.',
+            'Discuss the homework reflections before any new topic.',
+            room.reflectionOpeningLine,
+            'Read their own words back to each partner by name.',
+            'Challenge contradictions, defensiveness, and avoidance before you move on.',
+        ]
+            .filter(Boolean)
+            .join(' '),
+    });
+};
 /* ------------------------------------------------------------------ */
 /*  Build opening greeting                                             */
 /* ------------------------------------------------------------------ */
-const buildOpeningGreeting = (room, connectedPartners) => {
-    const bothPresent = connectedPartners.length >= 2;
-    const singleName = connectedPartners[0] || 'Partner';
+const buildOpeningGreeting = (room, activeConnections) => {
+    const bothPresent = activeConnections.length >= 2;
+    const firstConnection = activeConnections[0];
+    const singleName = firstConnection?.partnerName || 'Partner';
     if (room.hasReflections && bothPresent) {
-        return `Welcome back, ${room.partnerAName} and ${room.partnerBName}. Before we do anything else, I want to talk about the reflections you both wrote. I have read every word. Let us see if you actually meant them, or if you were just going through the motions.`;
+        return `Welcome back, ${room.partnerAName} and ${room.partnerBName}. ${room.reflectionOpeningLine}`;
     }
-    if (room.hasReflections && !bothPresent) {
-        return `Welcome back, ${singleName}. Your partner is not here yet. While we wait, I have been reviewing the reflections from your homework. Let us talk about what you wrote — did you mean it, or were you performing?`;
+    if (room.hasReflections && !bothPresent && room.couple && firstConnection) {
+        const soloOpening = MemoryApplication.buildReflectionOpeningLine(room.couple, {
+            presentPartnerRole: firstConnection.partnerRole,
+        });
+        return `Welcome back, ${singleName}. ${soloOpening}`;
     }
     if (bothPresent) {
         return `Welcome. I am Mirror. I am not here to be your friend. I am here to find the truth sitting between the two of you. ${room.partnerAName}, you go first. What is breaking down?`;
     }
-    return `Welcome, ${singleName}. I am Mirror. Your partner is not here yet, but we can start. Tell me what is really on your mind — the thing you have been avoiding saying.`;
+    return `Welcome, ${singleName}. I am Mirror. Your partner is not here yet, but we can start. Tell me what is really on your mind - the thing you have been avoiding saying.`;
 };
 /* ------------------------------------------------------------------ */
 /*  Deepgram STT connection per partner                                */
@@ -407,6 +439,7 @@ const processUserUtterance = async (room, text, speakerName, speakerRole) => {
         const analysis = analyzeUtterance(room, text, speakerName);
         room.honestyScore = clampScore(room.honestyScore + analysis.honestyDelta, 1, 100);
         room.escalationLevel = clampScore(room.escalationLevel + analysis.escalationDelta, 0, 100);
+        persistRoomHonesty(room);
         // Broadcast honesty/escalation updates to all clients
         broadcastJson(room, {
             type: 'honesty_update',
@@ -471,22 +504,31 @@ const processUserUtterance = async (room, text, speakerName, speakerRole) => {
             broadcastJson(room, { type: 'error', message: 'OpenRouter API key is not configured.' });
             return;
         }
-        const client = new OpenAI({
-            apiKey: env.OPENROUTER_API_KEY,
-            baseURL: env.OPENROUTER_BASE_URL,
-            defaultHeaders: {
-                'HTTP-Referer': env.OPENROUTER_HTTP_REFERER,
-                'X-Title': env.OPENROUTER_APP_NAME,
-            },
+        const client = createOpenRouterClient({
+            defaultMaxTokens: LLM_MAX_TOKENS,
         });
         broadcastJson(room, { type: 'status', status: 'thinking' });
-        const stream = await client.chat.completions.create({
-            model: LLM_MODEL,
-            messages: room.chatHistory,
-            max_tokens: LLM_MAX_TOKENS,
-            temperature: LLM_TEMPERATURE,
-            stream: true,
-        }, { signal: abortController.signal });
+        let stream = null;
+        let lastModelError = null;
+        for (const attempt of getModelAttemptOrder(room.selectedModel)) {
+            try {
+                stream = await client.chat.completions.create({
+                    model: attempt.id,
+                    messages: room.chatHistory,
+                    max_tokens: LLM_MAX_TOKENS,
+                    temperature: LLM_TEMPERATURE,
+                    stream: true,
+                }, { signal: abortController.signal });
+                break;
+            }
+            catch (error) {
+                lastModelError = error;
+                console.warn(`[voice-ws] Model attempt failed for ${attempt.id} in session ${room.sessionId}.`, error);
+            }
+        }
+        if (!stream) {
+            throw lastModelError ?? new Error('No OpenRouter model could start a streamed response.');
+        }
         let fullResponse = '';
         let sentenceBuffer = '';
         for await (const chunk of stream) {
@@ -542,12 +584,7 @@ const processUserUtterance = async (room, text, speakerName, speakerRole) => {
                 text: fullResponse.trim(),
                 source: 'agent-livekit',
             });
-            // Update honesty score in DB
-            void SessionModel.findByIdAndUpdate(room.sessionId, {
-                $set: {
-                    'metrics.honestyScore': room.honestyScore,
-                },
-            });
+            persistRoomHonesty(room);
         }
     }
     catch (error) {
@@ -556,7 +593,10 @@ const processUserUtterance = async (room, text, speakerName, speakerRole) => {
         }
         else {
             console.error('[voice-ws] LLM processing error:', error);
-            broadcastJson(room, { type: 'error', message: 'Failed to generate response.' });
+            broadcastJson(room, {
+                type: 'error',
+                message: 'Mirror could not reach the selected voice model. Try reconnecting or switching the session model.',
+            });
         }
     }
     finally {
@@ -658,6 +698,12 @@ const getOrCreateRoom = async (sessionId) => {
     const openingContext = sessionDoc.openingContext || '';
     // Determine if there are reflections to discuss
     const hasReflections = homeworkReflections.length > 0;
+    const reflectionOpeningLine = hasReflections
+        ? MemoryApplication.buildReflectionOpeningLine(couple)
+        : '';
+    const initialHonestyScore = typeof sessionDoc.metrics?.honestyScore === 'number' && sessionDoc.metrics.honestyScore > 0
+        ? sessionDoc.metrics.honestyScore
+        : 50;
     const room = {
         sessionId,
         coupleId: coupleIdStr,
@@ -669,18 +715,21 @@ const getOrCreateRoom = async (sessionId) => {
         currentAbortController: null,
         utteranceBuffer: '',
         utteranceBufferSpeaker: '',
-        honestyScore: 50, // Start at neutral baseline (not 72)
+        honestyScore: initialHonestyScore,
         escalationLevel: 25,
-        interventionCount: 0,
+        interventionCount: sessionDoc.metrics?.interventionCount || 0,
         recentUserTurns: [],
+        selectedModel: sessionDoc.selectedModel,
         partnerAName,
         partnerBName,
         couple,
         openingContext,
         homeworkReflections,
         fullReflectionHistory,
+        reflectionOpeningLine,
         hasReflections,
         sessionStarted: false,
+        reflectionKickoffDelivered: false,
         closed: false,
     };
     // Build system prompt with full context
@@ -726,6 +775,7 @@ export const attachVoiceWebSocket = (server) => {
     wss.on('connection', (ws, request) => {
         void handleVoiceConnection(ws, request);
     });
+    markVoiceWebSocketAttached();
     console.info('[voice-ws] WebSocket voice pipeline attached at /api/voice');
 };
 /* ------------------------------------------------------------------ */
@@ -810,11 +860,13 @@ const handleVoiceConnection = async (ws, request) => {
             return;
         // Only greet once when the first partner connects, or when second partner joins
         const activeConnections = Array.from(room.connections.values()).filter((c) => !c.closed);
-        const connectedPartnerNames = activeConnections.map((c) => c.partnerName);
-        if (!room.sessionStarted || activeConnections.length === 2) {
-            const greeting = buildOpeningGreeting(room, connectedPartnerNames);
+        if (!room.sessionStarted) {
+            const greeting = buildOpeningGreeting(room, activeConnections);
             room.chatHistory.push({ role: 'assistant', content: greeting });
             room.sessionStarted = true;
+            if (room.hasReflections && activeConnections.length >= 2) {
+                queueReflectionKickoff(room);
+            }
             broadcastJson(room, {
                 type: 'transcript',
                 speaker: 'mirror',
@@ -826,47 +878,29 @@ const handleVoiceConnection = async (ws, request) => {
             });
             void synthesizeAndBroadcast(room, greeting, new AbortController());
             broadcastJson(room, { type: 'response_end' });
-            // If second partner just joined, announce and then discuss reflections
-            if (activeConnections.length === 2 && room.sessionStarted) {
-                const secondPartner = activeConnections.find((c) => c.partnerRole !== activeConnections[0].partnerRole);
-                if (secondPartner) {
-                    const joinAnnouncement = room.hasReflections
-                        ? `${secondPartner.partnerName} has joined. Good. Now we are all here. I have your reflections in front of me and we are going to discuss them before anything else.`
-                        : `${secondPartner.partnerName} has joined. Good. Now we can work. Let me be clear — I see both of you and I will hold both of you accountable equally.`;
-                    setTimeout(() => {
-                        if (room.closed)
-                            return;
-                        room.chatHistory.push({ role: 'assistant', content: joinAnnouncement });
-                        broadcastJson(room, {
-                            type: 'transcript',
-                            speaker: 'mirror',
-                            partnerRole: 'mirror',
-                            partnerName: 'Mirror',
-                            text: joinAnnouncement,
-                            isFinal: true,
-                            speechFinal: true,
-                        });
-                        void synthesizeAndBroadcast(room, joinAnnouncement, new AbortController());
-                        // If there are reflections, inject a system prompt to make the AI discuss them
-                        if (room.hasReflections) {
-                            setTimeout(() => {
-                                if (room.closed)
-                                    return;
-                                room.chatHistory.push({
-                                    role: 'system',
-                                    content: [
-                                        'IMPORTANT: Both partners are now present. Begin the reflection review.',
-                                        'Summarize what each partner wrote in their reflections.',
-                                        'Read their words back to them and ask if they meant it.',
-                                        'Look for contradictions, growth, or avoidance patterns.',
-                                        'Do NOT move on to new topics until the reflections have been discussed.',
-                                    ].join(' '),
-                                });
-                            }, 2000);
-                        }
-                    }, 3000);
-                }
-            }
+            return;
+        }
+        if (activeConnections.length === 2 && !room.reflectionKickoffDelivered) {
+            const secondPartner = { partnerName };
+            const joinAnnouncement = room.hasReflections
+                ? `Good. Both of you are here now. ${room.reflectionOpeningLine}`
+                : `${secondPartner.partnerName} has joined. Good. Now we can work. Let me be clear — I see both of you and I will hold both of you accountable equally.`;
+            setTimeout(() => {
+                if (room.closed)
+                    return;
+                room.chatHistory.push({ role: 'assistant', content: joinAnnouncement });
+                broadcastJson(room, {
+                    type: 'transcript',
+                    speaker: 'mirror',
+                    partnerRole: 'mirror',
+                    partnerName: 'Mirror',
+                    text: joinAnnouncement,
+                    isFinal: true,
+                    speechFinal: true,
+                });
+                void synthesizeAndBroadcast(room, joinAnnouncement, new AbortController());
+                queueReflectionKickoff(room);
+            }, 1800);
         }
     }, 1500);
     // Handle incoming messages from this partner's browser

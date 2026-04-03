@@ -6,6 +6,7 @@ import { HttpError } from '../infrastructure/Errors/HttpError.js';
 import { generateTruthReport } from '../infrastructure/OpenRouter/openRouterService.js';
 import { MemoryApplication } from './MemoryApplication.js';
 import { analyzeSessionHonesty } from '../infrastructure/Embeddings/embeddingService.js';
+import { mapCoupleSummary } from './CoupleApplication.js';
 const findCoupleByUserId = async (userId) => CoupleModel.findOne({
     $or: [{ partnerAUserId: userId }, { partnerBUserId: userId }],
 });
@@ -39,6 +40,49 @@ const resolveSpeaker = (couple, userId) => {
     throw new HttpError(403, 'You are not attached to this couple workspace.');
 };
 const createRoomName = (coupleId) => `mirror-${coupleId}-${Date.now()}`;
+const ACCOUNTABILITY_PATTERNS = [
+    /i realize/i,
+    /i was wrong/i,
+    /my fault/i,
+    /i should have/i,
+    /i'm sorry/i,
+    /i take responsibility/i,
+];
+const clipLine = (text, maxLength = 140) => {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maxLength) {
+        return normalized;
+    }
+    return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+};
+const buildConversationDigest = (args) => {
+    const { session, couple } = args;
+    const report = session.report;
+    if (!report) {
+        return '';
+    }
+    const partnerTurns = session.transcriptSegments.filter((segment) => segment.speakerRole === 'partner_a' || segment.speakerRole === 'partner_b');
+    const accountabilityMoments = partnerTurns
+        .filter((segment) => ACCOUNTABILITY_PATTERNS.some((pattern) => pattern.test(segment.text)))
+        .slice(0, 4)
+        .map((segment) => `${segment.speakerLabel}: "${clipLine(segment.text, 110)}"`);
+    const interventions = session.interventions
+        .slice(-3)
+        .map((event) => `${event.severity} intervention: ${clipLine(event.line, 120)}`);
+    const unresolvedMoments = partnerTurns
+        .slice(-4)
+        .map((segment) => `${segment.speakerLabel}: "${clipLine(segment.text, 100)}"`);
+    return [
+        `Conversation digest for ${couple.partnerAName} and ${couple.partnerBName || 'Partner B'}.`,
+        `Core conflict: ${report.coreConflict}.`,
+        `Truth summary: ${report.truthSummary}.`,
+        `Observed patterns: ${report.observedPatterns.join(', ') || 'none clearly named'}.`,
+        `Accountability moments: ${accountabilityMoments.join(' | ') || 'No clear accountability language was captured in this session.'}`,
+        `Key interventions: ${interventions.join(' | ') || 'No direct therapist interventions were recorded.'}`,
+        `Unresolved conflict points to revisit next session: ${report.nextGoal}.`,
+        `Recent live quotes: ${unresolvedMoments.join(' | ') || 'Transcript sample was too short for quote excerpts.'}`,
+    ].join('\n');
+};
 const clearStaleHomeworkGateIfNeeded = async (couple) => {
     const gate = couple.activeHomeworkGate;
     if (!gate) {
@@ -192,7 +236,7 @@ export class SessionApplication {
         }).catch((error) => {
             console.warn('[session] Failed to store reflection in vector memory:', error);
         });
-        return couple;
+        return mapCoupleSummary(couple);
     }
     static async completeSession(userId, sessionId) {
         const couple = await findCoupleByUserId(userId);
@@ -291,6 +335,17 @@ export class SessionApplication {
             }).catch((error) => {
                 console.warn('[session] Failed to store session summary in vector memory:', error);
             });
+            const conversationDigest = buildConversationDigest({ session, couple });
+            if (conversationDigest) {
+                void MemoryApplication.storeConversationDigest({
+                    coupleId: toObjectIdString(couple._id),
+                    sessionId: toObjectIdString(session._id),
+                    digestText: conversationDigest,
+                    sessionSummary: report.truthSummary,
+                }).catch((error) => {
+                    console.warn('[session] Failed to store conversation digest in vector memory:', error);
+                });
+            }
         }
         return mapSessionSummary(session);
     }
@@ -325,6 +380,7 @@ export class SessionApplication {
         if (reflectionContext) {
             metadata.reflectionContext = reflectionContext;
             metadata.hasReflections = 'true';
+            metadata.reflectionOpeningLine = MemoryApplication.buildReflectionOpeningLine(couple);
         }
         return metadata;
     }

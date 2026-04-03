@@ -1,5 +1,7 @@
-import { HfInference } from '@huggingface/inference';
+import { createHash } from 'node:crypto';
+import { InferenceClient } from '@huggingface/inference';
 import { env } from '../Config/env.js';
+import { recordClassificationRuntime, recordEmbeddingRuntime, } from '../Runtime/runtimeStatus.js';
 /* ------------------------------------------------------------------ */
 /*  Models                                                              */
 /* ------------------------------------------------------------------ */
@@ -12,11 +14,118 @@ export const EMBEDDING_DIMENSIONS = 384;
 let hfClient = null;
 const getHfClient = () => {
     if (!hfClient) {
-        // Works without API key for public models (rate-limited).
-        // With a free HuggingFace token, you get higher rate limits.
-        hfClient = new HfInference(env.HUGGINGFACE_API_KEY || undefined);
+        hfClient = new InferenceClient(env.HUGGINGFACE_API_KEY || undefined);
     }
     return hfClient;
+};
+const normalizeText = (text) => text
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+const zeroVector = () => new Array(EMBEDDING_DIMENSIONS).fill(0);
+const normalizeVectorLength = (vector) => {
+    if (vector.length === EMBEDDING_DIMENSIONS) {
+        return vector;
+    }
+    if (vector.length > EMBEDDING_DIMENSIONS) {
+        return vector.slice(0, EMBEDDING_DIMENSIONS);
+    }
+    return [...vector, ...new Array(EMBEDDING_DIMENSIONS - vector.length).fill(0)];
+};
+const l2Normalize = (vector) => {
+    const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+    if (!magnitude) {
+        return vector;
+    }
+    return vector.map((value) => Number((value / magnitude).toFixed(8)));
+};
+const hashToUnsignedInt = (value) => createHash('sha256')
+    .update(value)
+    .digest()
+    .readUInt32BE(0);
+const buildLocalEmbedding = (text) => {
+    const normalized = normalizeText(text);
+    if (!normalized) {
+        return zeroVector();
+    }
+    const vector = zeroVector();
+    const tokens = normalized.split(' ').filter(Boolean);
+    const trigrams = [];
+    for (let i = 0; i < normalized.length - 2; i += 1) {
+        trigrams.push(normalized.slice(i, i + 3));
+    }
+    const features = [
+        ...tokens.map((token, index) => ({ value: `tok:${index}:${token}`, weight: 1 + Math.log1p(token.length) })),
+        ...trigrams.map((gram) => ({ value: `tri:${gram}`, weight: 0.35 })),
+    ];
+    for (const feature of features) {
+        for (let seed = 0; seed < 3; seed += 1) {
+            const hash = hashToUnsignedInt(`${seed}:${feature.value}`);
+            const dimension = hash % EMBEDDING_DIMENSIONS;
+            const sign = (hash & 1) === 0 ? 1 : -1;
+            vector[dimension] += sign * feature.weight;
+        }
+    }
+    return l2Normalize(vector);
+};
+const extractStatusCode = (error) => {
+    if (!error || typeof error !== 'object') {
+        return null;
+    }
+    const candidate = error.status ??
+        error.response?.status;
+    return typeof candidate === 'number' ? candidate : null;
+};
+const classifyHfFailure = (error) => {
+    const status = extractStatusCode(error);
+    const rawMessage = error instanceof Error ? error.message : String(error ?? 'Unknown Hugging Face error');
+    const message = rawMessage.trim();
+    const lower = message.toLowerCase();
+    if (status === 401 ||
+        status === 403 ||
+        lower.includes('unauthorized') ||
+        lower.includes('forbidden') ||
+        lower.includes('invalid token') ||
+        lower.includes('api key')) {
+        return { type: 'auth', message };
+    }
+    if (status === 400 ||
+        status === 404 ||
+        status === 422 ||
+        lower.includes('provider') ||
+        lower.includes('endpoint') ||
+        lower.includes('model') ||
+        lower.includes('route')) {
+        return { type: 'provider', message };
+    }
+    if (status === 408 ||
+        status === 409 ||
+        status === 425 ||
+        status === 429 ||
+        status === 500 ||
+        status === 502 ||
+        status === 503 ||
+        status === 504 ||
+        lower.includes('rate limit') ||
+        lower.includes('timeout') ||
+        lower.includes('temporar') ||
+        lower.includes('overloaded') ||
+        lower.includes('service unavailable')) {
+        return { type: 'transient', message };
+    }
+    return { type: 'unknown', message };
+};
+const normalizeFeatureExtractionOutput = (result) => {
+    if (!Array.isArray(result) || result.length === 0) {
+        return null;
+    }
+    if (typeof result[0] === 'number') {
+        return normalizeVectorLength(result);
+    }
+    if (Array.isArray(result[0]) && typeof result[0][0] === 'number') {
+        return normalizeVectorLength(result[0]);
+    }
+    return null;
 };
 /* ------------------------------------------------------------------ */
 /*  Embedding generation                                                */
@@ -24,28 +133,70 @@ const getHfClient = () => {
 export const generateEmbedding = async (text) => {
     const trimmed = text.trim();
     if (!trimmed) {
-        return new Array(EMBEDDING_DIMENSIONS).fill(0);
+        return {
+            vector: zeroVector(),
+            provider: 'local-hash',
+            fallbackUsed: false,
+            failureType: null,
+        };
     }
     try {
         const client = getHfClient();
         const result = await client.featureExtraction({
+            accessToken: env.HUGGINGFACE_API_KEY || undefined,
             model: EMBEDDING_MODEL,
-            inputs: trimmed.slice(0, 2048), // limit to ~2k chars to stay within model context
+            endpointUrl: env.HUGGINGFACE_EMBEDDING_ENDPOINT || undefined,
+            provider: 'hf-inference',
+            encoding_format: 'float',
+            dimensions: EMBEDDING_DIMENSIONS,
+            inputs: trimmed.slice(0, 2048),
         });
-        // sentence-transformers returns a flat array for a single input
-        if (Array.isArray(result) && typeof result[0] === 'number') {
-            return result;
+        const normalized = normalizeFeatureExtractionOutput(result);
+        if (normalized && normalized.some((value) => value !== 0)) {
+            recordEmbeddingRuntime({
+                embeddingMode: 'huggingface',
+                provider: 'huggingface',
+                failureType: null,
+                failureMessage: null,
+            });
+            return {
+                vector: l2Normalize(normalized),
+                provider: 'huggingface',
+                fallbackUsed: false,
+                failureType: null,
+            };
         }
-        // If nested (batch output), take the first
-        if (Array.isArray(result) && Array.isArray(result[0])) {
-            return result[0];
-        }
-        return new Array(EMBEDDING_DIMENSIONS).fill(0);
     }
     catch (error) {
-        console.warn('[embedding] Failed to generate embedding, returning zero vector:', error);
-        return new Array(EMBEDDING_DIMENSIONS).fill(0);
+        const failure = classifyHfFailure(error);
+        console.warn(`[embedding] Hugging Face embedding failed (${failure.type}). Falling back to local hash embedding.`, error);
+        const localVector = buildLocalEmbedding(trimmed);
+        recordEmbeddingRuntime({
+            embeddingMode: env.HUGGINGFACE_API_KEY ? 'hybrid' : 'local-fallback',
+            provider: 'local-hash',
+            failureType: failure.type,
+            failureMessage: failure.message,
+        });
+        return {
+            vector: localVector,
+            provider: 'local-hash',
+            fallbackUsed: true,
+            failureType: failure.type,
+        };
     }
+    const fallbackVector = buildLocalEmbedding(trimmed);
+    recordEmbeddingRuntime({
+        embeddingMode: env.HUGGINGFACE_API_KEY ? 'hybrid' : 'local-fallback',
+        provider: 'local-hash',
+        failureType: 'provider',
+        failureMessage: 'Hugging Face returned an empty or unsupported embedding payload.',
+    });
+    return {
+        vector: fallbackVector,
+        provider: 'local-hash',
+        fallbackUsed: true,
+        failureType: 'provider',
+    };
 };
 /* ------------------------------------------------------------------ */
 /*  Honesty analysis via zero-shot classification                      */
@@ -81,7 +232,10 @@ export const analyzeHonesty = async (text) => {
     try {
         const client = getHfClient();
         const result = await client.zeroShotClassification({
+            accessToken: env.HUGGINGFACE_API_KEY || undefined,
             model: CLASSIFICATION_MODEL,
+            endpointUrl: env.HUGGINGFACE_CLASSIFICATION_ENDPOINT || undefined,
+            provider: 'hf-inference',
             inputs: trimmed,
             parameters: { candidate_labels: HONESTY_LABELS },
         });
@@ -112,7 +266,12 @@ export const analyzeHonesty = async (text) => {
         };
     }
     catch (error) {
-        console.warn('[honesty] HuggingFace analysis failed, returning neutral score:', error);
+        const failure = classifyHfFailure(error);
+        console.warn(`[honesty] Hugging Face zero-shot classification failed (${failure.type}). Using neutral fallback score.`, error);
+        recordClassificationRuntime({
+            failureType: failure.type,
+            failureMessage: failure.message,
+        });
         return { score: 50, label: 'unknown', confidence: 0, breakdown: {} };
     }
 };

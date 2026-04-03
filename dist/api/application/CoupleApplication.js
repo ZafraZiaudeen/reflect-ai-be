@@ -32,7 +32,7 @@ const buildInvitationUrl = (path, inviteCode, email) => {
     }
     return url.toString();
 };
-const mapCoupleSummary = (couple) => ({
+export const mapCoupleSummary = (couple) => ({
     id: toObjectIdString(couple._id),
     inviteCode: couple.inviteCode,
     preferredModel: couple.preferredModel,

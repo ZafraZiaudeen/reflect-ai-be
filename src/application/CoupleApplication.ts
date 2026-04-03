@@ -68,7 +68,7 @@ const buildInvitationUrl = (
   return url.toString();
 };
 
-const mapCoupleSummary = (couple: CoupleDocument): CoupleSummary => ({
+export const mapCoupleSummary = (couple: CoupleDocument): CoupleSummary => ({
   id: toObjectIdString(couple._id),
   inviteCode: couple.inviteCode,
   preferredModel: couple.preferredModel,

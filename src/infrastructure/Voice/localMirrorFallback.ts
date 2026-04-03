@@ -16,6 +16,7 @@ type AgentMetadata = {
   partnerBName?: string;
   homeworkTitle?: string;
   reflectionContext?: string;
+  reflectionOpeningLine?: string;
   hasReflections?: string;
 };
 
@@ -215,13 +216,13 @@ const buildFullWelcomeLine = (args: {
   partnerAName: string;
   partnerBName: string;
   homeworkTitle?: string;
+  reflectionOpeningLine?: string;
   hasReflections?: boolean;
 }): string => {
   if (args.hasReflections) {
     return [
       `Welcome back, ${args.partnerAName} and ${args.partnerBName}.`,
-      'Before we do anything else, I want to talk about what you both wrote in your reflections.',
-      'I have read every word. Let us see if you meant them.',
+      args.reflectionOpeningLine || 'Before we do anything else, I want to talk about what you both wrote in your reflections.',
     ].join(' ');
   }
 
@@ -626,6 +627,7 @@ export const ensureLocalMirrorFallback = async ({
             partnerAName: coupleContext.partnerAName,
             partnerBName: coupleContext.partnerBName || 'Partner B',
             homeworkTitle: coupleContext.homeworkTitle,
+            reflectionOpeningLine: parsedMetadata.reflectionOpeningLine,
             hasReflections,
           }),
         );
@@ -636,6 +638,7 @@ export const ensureLocalMirrorFallback = async ({
             const queueHandle = liveSession.generateReply({
               instructions: [
                 'Now review the reflections both partners wrote (included in your context).',
+                parsedMetadata.reflectionOpeningLine || '',
                 'Summarize what each partner wrote in their own words.',
                 'Ask each partner directly: "Did you mean what you wrote, or were you performing for the exercise?"',
                 'Look for contradictions between their reflections and their past behavior.',

@@ -32,6 +32,7 @@ import { Schema, model, type HydratedDocument, type Model, type Types } from 'mo
 export interface ReflectionMemoryRecord {
   coupleId: Types.ObjectId;
   sessionId: Types.ObjectId;
+  memoryType: 'reflection' | 'session_summary' | 'conversation_digest';
   userId: string;
   partnerRole: 'partner_a' | 'partner_b' | 'system';
   partnerName: string;
@@ -40,6 +41,8 @@ export interface ReflectionMemoryRecord {
   reflectionText: string;
   sessionSummary: string;
   embedding: number[];
+  embeddingProvider: 'huggingface' | 'local-hash';
+  embeddingFallback: boolean;
   sessionNumber: number;
   createdAt: Date;
   updatedAt: Date;
@@ -51,6 +54,7 @@ const ReflectionMemorySchema = new Schema<ReflectionMemoryRecord>(
   {
     coupleId: { type: Schema.Types.ObjectId, required: true, ref: 'Couple', index: true },
     sessionId: { type: Schema.Types.ObjectId, required: true, ref: 'Session', index: true },
+    memoryType: { type: String, required: true, index: true },
     userId: { type: String, required: true, index: true },
     partnerRole: { type: String, required: true },
     partnerName: { type: String, required: true },
@@ -59,6 +63,8 @@ const ReflectionMemorySchema = new Schema<ReflectionMemoryRecord>(
     reflectionText: { type: String, required: true },
     sessionSummary: { type: String, default: '' },
     embedding: { type: [Number], default: [] },
+    embeddingProvider: { type: String, default: 'local-hash' },
+    embeddingFallback: { type: Boolean, default: false },
     sessionNumber: { type: Number, default: 1 },
   },
   {
@@ -70,7 +76,7 @@ const ReflectionMemorySchema = new Schema<ReflectionMemoryRecord>(
 ReflectionMemorySchema.index({ coupleId: 1, createdAt: -1 });
 
 // Compound index for upsert lookups
-ReflectionMemorySchema.index({ coupleId: 1, sessionId: 1, userId: 1, assignmentTitle: 1 });
+ReflectionMemorySchema.index({ coupleId: 1, sessionId: 1, memoryType: 1, userId: 1, assignmentTitle: 1 });
 
 export const ReflectionMemoryModel: Model<ReflectionMemoryRecord> = model<ReflectionMemoryRecord>(
   'ReflectionMemory',

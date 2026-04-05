@@ -17,7 +17,9 @@ const HomeworkAssignmentSchema = new Schema(
     title: { type: String, required: true },
     description: { type: String, required: true },
     reflectionPrompt: { type: String, required: true },
-    reflections: { type: [HomeworkReflectionSchema], default: [] },
+    targetPartnerRole: { type: String },
+    submission: { type: HomeworkReflectionSchema, default: null },
+    reflections: { type: [HomeworkReflectionSchema], default: undefined },
   },
   { _id: false },
 );

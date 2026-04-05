@@ -23,6 +23,8 @@ const envSchema = z.object({
     SMTP_PASS: z.string().optional(),
     SMTP_FROM: z.string().optional(),
     HUGGINGFACE_API_KEY: z.string().optional(),
+    HUGGINGFACE_EMBEDDING_ENDPOINT: z.string().optional(),
+    HUGGINGFACE_CLASSIFICATION_ENDPOINT: z.string().optional(),
 });
 const parsed = envSchema.parse(process.env);
 export const env = {

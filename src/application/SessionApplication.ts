@@ -18,6 +18,10 @@ import { generateTruthReport } from '../infrastructure/OpenRouter/openRouterServ
 import { MemoryApplication } from './MemoryApplication.js';
 import { analyzeSessionHonesty } from '../infrastructure/Embeddings/embeddingService.js';
 import { mapCoupleSummary } from './CoupleApplication.js';
+import {
+  ensureHomeworkGateIntegrity,
+  normalizeHomeworkGateForCouple,
+} from './HomeworkGateApplication.js';
 
 const findCoupleByUserId = async (userId: string): Promise<CoupleDocument | null> =>
   CoupleModel.findOne({
@@ -113,33 +117,6 @@ const buildConversationDigest = (args: {
   ].join('\n');
 };
 
-const clearStaleHomeworkGateIfNeeded = async (couple: CoupleDocument): Promise<void> => {
-  const gate = couple.activeHomeworkGate;
-  if (!gate) {
-    return;
-  }
-
-  const sourceSession = await SessionModel.findById(gate.sourceSessionId);
-  if (!sourceSession) {
-    couple.activeHomeworkGate = null;
-    await couple.save();
-    return;
-  }
-
-  const isMeaningful = isMeaningfulSessionAttempt({
-    transcriptSegments: sourceSession.transcriptSegments,
-    interventions: sourceSession.interventions,
-    metrics: sourceSession.metrics,
-  });
-
-  if (isMeaningful) {
-    return;
-  }
-
-  couple.activeHomeworkGate = null;
-  await couple.save();
-};
-
 export class SessionApplication {
   static async createSession(userId: string, selectedModel?: string): Promise<SessionSummary> {
     const couple = await findCoupleByUserId(userId);
@@ -150,9 +127,12 @@ export class SessionApplication {
       throw new HttpError(409, 'Both partners must join before a session can start.');
     }
 
-    await clearStaleHomeworkGateIfNeeded(couple);
+    const { gate, changed } = await ensureHomeworkGateIntegrity(couple);
+    if (changed) {
+      await couple.save();
+    }
 
-    const blockerReason = getSessionStartBlocker(couple.activeHomeworkGate);
+    const blockerReason = getSessionStartBlocker(gate);
     if (blockerReason) {
       throw new HttpError(409, blockerReason);
     }
@@ -262,48 +242,119 @@ export class SessionApplication {
       throw new HttpError(404, 'Couple workspace not found.');
     }
 
-    const gate = couple.activeHomeworkGate;
+    const { gate, changed } = await ensureHomeworkGateIntegrity(couple);
+    if (changed) {
+      await couple.save();
+    }
     if (!gate || gate.sourceSessionId !== sessionId) {
       throw new HttpError(404, 'No active homework gate was found for this session.');
     }
 
-    const assignment = gate.assignments.find((item) => item.id === input.assignmentId);
+    const speaker = resolveSpeaker(couple, userId);
+    const assignment = gate.assignments.find(
+      (item) => item.id === input.assignmentId && item.targetPartnerRole === speaker.speakerRole,
+    );
     if (!assignment) {
       throw new HttpError(404, 'Homework assignment not found.');
     }
 
-    assignment.reflections = assignment.reflections.filter((reflection) => reflection.userId !== userId);
-    assignment.reflections.push({
+    const submission = {
       userId,
-      completed: input.completed,
+      completed: true,
       reflection: input.reflection.trim(),
       submittedAt: new Date(),
-    });
-
-    const everyAssignmentCovered = gate.assignments.every(
-      (item) => item.reflections.length >= gate.requiredReflections,
+    };
+    let updateResult = await CoupleModel.updateOne(
+      {
+        _id: couple._id,
+        'activeHomeworkGate.sourceSessionId': sessionId,
+      },
+      {
+        $set: {
+          'activeHomeworkGate.assignments.$[assignment].submission': submission,
+        },
+      },
+      {
+        arrayFilters: [
+          {
+            'assignment.id': input.assignmentId,
+            'assignment.targetPartnerRole': speaker.speakerRole,
+          },
+        ],
+      },
     );
-    gate.unlockedAt = everyAssignmentCovered ? new Date() : null;
 
-    await couple.save();
+    if (updateResult.modifiedCount === 0) {
+      updateResult = await CoupleModel.updateOne(
+        {
+          _id: couple._id,
+          'activeHomeworkGate.sourceSessionId': sessionId,
+        },
+        {
+          $set: {
+            'activeHomeworkGate.assignments.$[assignment].submission': submission,
+          },
+        },
+        {
+          arrayFilters: [
+            {
+              'assignment.targetPartnerRole': speaker.speakerRole,
+            },
+          ],
+        },
+      );
+    }
+
+    if (updateResult.modifiedCount === 0) {
+      throw new HttpError(409, 'The reflection could not be saved for this assignment. Please try again.');
+    }
+
+    const refreshedCouple = await CoupleModel.findById(couple._id);
+    if (!refreshedCouple) {
+      throw new HttpError(404, 'Couple workspace not found.');
+    }
+
+    const { gate: refreshedGate, changed: refreshedChanged } = await ensureHomeworkGateIntegrity(refreshedCouple);
+    if (refreshedChanged) {
+      await refreshedCouple.save();
+    }
+    if (!refreshedGate || refreshedGate.sourceSessionId !== sessionId) {
+      throw new HttpError(404, 'No active homework gate was found for this session.');
+    }
+
+    const everyAssignmentCovered = refreshedGate.assignments.every(
+      (item) => Boolean(item.submission?.submittedAt),
+    );
+    if (everyAssignmentCovered && !refreshedGate.unlockedAt) {
+      const latestSubmittedAt =
+        refreshedGate.assignments
+          .map((item) => item.submission?.submittedAt)
+          .filter((submittedAt): submittedAt is Date => Boolean(submittedAt))
+          .sort((left, right) => right.getTime() - left.getTime())[0] ?? submission.submittedAt;
+
+      refreshedCouple.activeHomeworkGate = {
+        ...refreshedGate,
+        unlockedAt: latestSubmittedAt,
+      };
+      await refreshedCouple.save();
+    }
 
     // Store reflection in vector memory for future sessions
-    const isPartnerA = couple.partnerAUserId === userId;
     void MemoryApplication.storeReflection({
       coupleId: toObjectIdString(couple._id),
       sessionId,
       userId,
-      partnerRole: isPartnerA ? 'partner_a' : 'partner_b',
-      partnerName: isPartnerA ? couple.partnerAName : (couple.partnerBName || 'Partner B'),
+      partnerRole: speaker.speakerRole,
+      partnerName: speaker.speakerLabel,
       assignmentTitle: assignment.title,
       reflectionPrompt: assignment.reflectionPrompt,
       reflectionText: input.reflection.trim(),
-      sessionSummary: couple.memorySummary,
+      sessionSummary: refreshedCouple.memorySummary,
     }).catch((error) => {
       console.warn('[session] Failed to store reflection in vector memory:', error);
     });
 
-    return mapCoupleSummary(couple);
+    return mapCoupleSummary(refreshedCouple, userId, refreshedCouple.activeHomeworkGate ?? refreshedGate);
   }
 
   static async completeSession(userId: string, sessionId: string): Promise<SessionSummary> {
@@ -398,7 +449,7 @@ export class SessionApplication {
         unlockedAt: null,
         assignments: report.homework.map((assignment) => ({
           ...assignment,
-          reflections: [],
+          submission: null,
         })),
       };
       await couple.save();
@@ -438,8 +489,9 @@ export class SessionApplication {
   }
 
   static buildOpeningMetadata(couple: CoupleDocument, session: SessionDocument): Record<string, string> {
+    const { gate } = normalizeHomeworkGateForCouple(couple);
     const gateSummary =
-      couple.activeHomeworkGate?.assignments.map((assignment) => assignment.title).join(' | ') ||
+      gate?.assignments.map((assignment) => assignment.title).join(' | ') ||
       'No pending homework gate.';
 
     const metadata: Record<string, string> = {
@@ -457,7 +509,7 @@ export class SessionApplication {
       metadata.partnerBUserId = couple.partnerBUserId;
     }
 
-    const homeworkTitle = couple.activeHomeworkGate?.assignments[0]?.title;
+    const homeworkTitle = gate?.assignments[0]?.title;
     if (homeworkTitle) {
       metadata.homeworkTitle = homeworkTitle;
     }

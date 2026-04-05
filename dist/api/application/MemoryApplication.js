@@ -2,6 +2,7 @@ import { Types } from 'mongoose';
 import { ReflectionMemoryModel, } from '../domain/Models/ReflectionMemory.js';
 import { generateEmbedding, cosineSimilarity } from '../infrastructure/Embeddings/embeddingService.js';
 import { toObjectIdString } from '../domain/Types/mirror.js';
+import { getPartnerDisplayName, normalizeHomeworkGateForCouple, } from './HomeworkGateApplication.js';
 const summarizeInline = (text, maxLength = 100) => {
     const normalized = text.replace(/\s+/g, ' ').trim();
     if (!normalized) {
@@ -40,7 +41,6 @@ export class MemoryApplication {
                 assignmentTitle: args.assignmentTitle,
             }, {
                 $set: {
-                    memoryType: 'reflection',
                     partnerRole: args.partnerRole,
                     partnerName: args.partnerName,
                     reflectionPrompt: args.reflectionPrompt,
@@ -84,7 +84,6 @@ export class MemoryApplication {
                 assignmentTitle: 'Session Summary',
             }, {
                 $set: {
-                    memoryType: 'session_summary',
                     partnerRole: 'system',
                     partnerName: 'Mirror',
                     reflectionPrompt: 'session-summary',
@@ -119,7 +118,6 @@ export class MemoryApplication {
                 assignmentTitle: 'Conversation Digest',
             }, {
                 $set: {
-                    memoryType: 'conversation_digest',
                     partnerRole: 'system',
                     partnerName: 'Mirror',
                     reflectionPrompt: 'conversation-digest',
@@ -281,12 +279,10 @@ export class MemoryApplication {
      * discuss at the start of the next session.
      */
     static buildCurrentReflectionsForDiscussion(couple) {
-        const gate = couple.activeHomeworkGate;
+        const { gate } = normalizeHomeworkGateForCouple(couple);
         if (!gate || gate.assignments.length === 0) {
             return '';
         }
-        const partnerAName = couple.partnerAName;
-        const partnerBName = couple.partnerBName || 'Partner B';
         const parts = [
             '=== REFLECTIONS TO DISCUSS THIS SESSION ===',
             'YOU MUST review these reflections with both partners before moving to any other topic.',
@@ -294,57 +290,40 @@ export class MemoryApplication {
             '',
         ];
         for (const assignment of gate.assignments) {
+            const partnerName = getPartnerDisplayName(couple, assignment.targetPartnerRole);
             parts.push(`Assignment: "${assignment.title}"`);
+            parts.push(`Assigned to: ${partnerName}`);
             parts.push(`Description: ${assignment.description}`);
             parts.push(`Prompt: "${assignment.reflectionPrompt}"`);
             parts.push('');
-            for (const reflection of assignment.reflections) {
-                const isPartnerA = reflection.userId === couple.partnerAUserId;
-                const name = isPartnerA ? partnerAName : partnerBName;
-                parts.push(`  ${name} wrote (completed: ${reflection.completed}):`);
-                parts.push(`  "${reflection.reflection}"`);
-                parts.push('');
+            if (assignment.submission?.reflection.trim()) {
+                parts.push(`  ${partnerName} wrote (completed: ${assignment.submission.completed}):`);
+                parts.push(`  "${assignment.submission.reflection}"`);
             }
-            if (assignment.reflections.length === 0) {
-                parts.push('  WARNING: No reflections submitted. Call this out immediately.');
-                parts.push('');
-            }
-            const partnerAReflection = assignment.reflections.find((r) => r.userId === couple.partnerAUserId);
-            const partnerBReflection = assignment.reflections.find((r) => r.userId === couple.partnerBUserId);
-            if (!partnerAReflection) {
-                parts.push(`  ${partnerAName} DID NOT submit a reflection. Confront them about this.`);
-            }
-            if (!partnerBReflection) {
-                parts.push(`  ${partnerBName} DID NOT submit a reflection. Confront them about this.`);
+            else {
+                parts.push(`  ${partnerName} DID NOT submit a reflection. Confront them about this.`);
             }
             parts.push('');
         }
         return parts.join('\n');
     }
     static buildReflectionOpeningLine(couple, options) {
-        const gate = couple.activeHomeworkGate;
+        const { gate } = normalizeHomeworkGateForCouple(couple);
         if (!gate || gate.assignments.length === 0) {
             return '';
         }
-        const describePartner = (partnerRole, partnerName, userId) => {
-            if (!userId) {
-                return '';
-            }
-            const partnerAssignments = gate.assignments.slice(0, 2).map((assignment) => {
-                const reflection = assignment.reflections.find((entry) => entry.userId === userId);
-                if (!reflection?.reflection.trim()) {
-                    return `${assignment.title}: no reflection submitted`;
-                }
-                return `${assignment.title}: "${summarizeInline(reflection.reflection, 88)}"`;
-            });
-            if (partnerAssignments.length === 0) {
+        const describePartner = (partnerRole, partnerName) => {
+            const assignment = gate.assignments.find((entry) => entry.targetPartnerRole === partnerRole);
+            if (!assignment) {
                 return `${partnerName}, there is no saved homework from you yet.`;
             }
-            const prefix = partnerRole === 'partner_a' ? `${partnerName}, you wrote` : `${partnerName}, you wrote`;
-            return `${prefix} ${partnerAssignments.join('; ')}.`;
+            if (!assignment.submission?.reflection.trim()) {
+                return `${partnerName}, you have not submitted your reflection for "${assignment.title}" yet.`;
+            }
+            return `${partnerName}, you wrote ${assignment.title}: "${summarizeInline(assignment.submission.reflection, 88)}".`;
         };
-        const partnerALine = describePartner('partner_a', couple.partnerAName, couple.partnerAUserId);
-        const partnerBLine = describePartner('partner_b', couple.partnerBName || 'Partner B', couple.partnerBUserId);
+        const partnerALine = describePartner('partner_a', couple.partnerAName);
+        const partnerBLine = describePartner('partner_b', couple.partnerBName || 'Partner B');
         if (options?.presentPartnerRole === 'partner_a') {
             return `${partnerALine} We start there, and we wait for ${couple.partnerBName || 'your partner'} before we move on.`;
         }

@@ -42,6 +42,7 @@ const HomeworkAssignmentSchema = new Schema(
     title: { type: String, required: true },
     description: { type: String, required: true },
     reflectionPrompt: { type: String, required: true },
+    targetPartnerRole: { type: String },
   },
   { _id: false },
 );

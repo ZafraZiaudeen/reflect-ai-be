@@ -4,6 +4,7 @@ export type SessionStatus = 'pending' | 'live' | 'completed' | 'interrupted';
 export type SpeakerRole = 'partner_a' | 'partner_b' | 'mirror' | 'system' | 'participant_unknown';
 export type InterventionStage = 'interrupt' | 'quote_evidence' | 'mirror' | 'continue_or_close';
 export type InterventionSeverity = 'watch' | 'firm' | 'red';
+export type PartnerRole = 'partner_a' | 'partner_b';
 
 export interface ModelOption {
   id: string;
@@ -21,6 +22,7 @@ export interface HomeworkAssignment {
   title: string;
   description: string;
   reflectionPrompt: string;
+  targetPartnerRole: PartnerRole;
 }
 
 export interface HomeworkReflection {
@@ -31,7 +33,8 @@ export interface HomeworkReflection {
 }
 
 export interface HomeworkGateAssignment extends HomeworkAssignment {
-  reflections: HomeworkReflection[];
+  submission?: HomeworkReflection | null;
+  reflections?: HomeworkReflection[];
 }
 
 export interface HomeworkGate {
@@ -39,6 +42,39 @@ export interface HomeworkGate {
   createdAt: Date;
   assignments: HomeworkGateAssignment[];
   requiredReflections: number;
+  unlockedAt?: Date | null;
+}
+
+export interface HomeworkSubmissionSummary {
+  completed: boolean;
+  reflection: string;
+  submittedAt: Date;
+}
+
+export interface HomeworkAssignmentSummary {
+  id: string;
+  title: string;
+  description: string;
+  reflectionPrompt: string;
+  targetPartnerRole: PartnerRole;
+  submission: HomeworkSubmissionSummary | null;
+}
+
+export interface HomeworkPartnerStatus {
+  targetPartnerRole: PartnerRole;
+  displayName: string;
+  hasSubmitted: boolean;
+  completed: boolean;
+  submittedAt?: Date | null;
+}
+
+export interface ActiveHomeworkGateSummary {
+  sourceSessionId: string;
+  createdAt: Date;
+  myAssignment: HomeworkAssignmentSummary | null;
+  partnerStatus: HomeworkPartnerStatus | null;
+  requiredReflections: number;
+  submittedCount: number;
   unlockedAt?: Date | null;
 }
 
@@ -107,7 +143,7 @@ export interface CoupleSummary {
     email?: string;
   };
   memorySummary: string;
-  activeHomeworkGate: HomeworkGate | null;
+  activeHomeworkGate: ActiveHomeworkGateSummary | null;
   pendingInvitation: WorkspaceInvitation | null;
 }
 

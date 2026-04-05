@@ -1,11 +1,12 @@
 import { CoupleModel } from '../domain/Models/Couple.js';
 import { SessionModel } from '../domain/Models/Session.js';
 import { UserProfileModel } from '../domain/Models/UserProfile.js';
-import { createInviteCode, getSessionStartBlocker, isMeaningfulSessionAttempt, } from '../domain/Rules/sessionRules.js';
+import { createInviteCode, getSessionStartBlocker, } from '../domain/Rules/sessionRules.js';
 import { DEFAULT_MODEL_ID, MODEL_CATALOG, getModelOption, toObjectIdString, } from '../domain/Types/mirror.js';
 import { env } from '../infrastructure/Config/env.js';
 import { HttpError } from '../infrastructure/Errors/HttpError.js';
 import { canSendWorkspaceInvitationEmails, sendWorkspaceInvitationEmail, } from '../infrastructure/Email/workspaceInviteMailer.js';
+import { ensureHomeworkGateIntegrity, mapHomeworkGateSummaryForUser, } from './HomeworkGateApplication.js';
 const findCoupleByUserId = async (userId) => CoupleModel.findOne({
     $or: [{ partnerAUserId: userId }, { partnerBUserId: userId }],
 });
@@ -32,7 +33,7 @@ const buildInvitationUrl = (path, inviteCode, email) => {
     }
     return url.toString();
 };
-export const mapCoupleSummary = (couple) => ({
+export const mapCoupleSummary = (couple, viewerUserId, activeHomeworkGate) => ({
     id: toObjectIdString(couple._id),
     inviteCode: couple.inviteCode,
     preferredModel: couple.preferredModel,
@@ -49,7 +50,7 @@ export const mapCoupleSummary = (couple) => ({
         }
         : undefined,
     memorySummary: couple.memorySummary,
-    activeHomeworkGate: couple.activeHomeworkGate ?? null,
+    activeHomeworkGate: mapHomeworkGateSummaryForUser(couple, viewerUserId, activeHomeworkGate),
     pendingInvitation: couple.pendingInvitation ?? null,
 });
 const mapSessionSummary = (session) => ({
@@ -66,28 +67,6 @@ const mapSessionSummary = (session) => ({
     interventions: session.interventions,
     metrics: session.metrics,
 });
-const clearStaleHomeworkGateIfNeeded = async (couple) => {
-    const gate = couple.activeHomeworkGate;
-    if (!gate) {
-        return;
-    }
-    const sourceSession = await SessionModel.findById(gate.sourceSessionId);
-    if (!sourceSession) {
-        couple.activeHomeworkGate = null;
-        await couple.save();
-        return;
-    }
-    const isMeaningful = isMeaningfulSessionAttempt({
-        transcriptSegments: sourceSession.transcriptSegments,
-        interventions: sourceSession.interventions,
-        metrics: sourceSession.metrics,
-    });
-    if (isMeaningful) {
-        return;
-    }
-    couple.activeHomeworkGate = null;
-    await couple.save();
-};
 export class CoupleApplication {
     static async createCouple(userId, input) {
         await ensureUserProfile(userId, input);
@@ -106,7 +85,7 @@ export class CoupleApplication {
             activeHomeworkGate: null,
             pendingInvitation: null,
         });
-        return mapCoupleSummary(couple);
+        return mapCoupleSummary(couple, userId);
     }
     static async joinCouple(userId, input) {
         await ensureUserProfile(userId, input);
@@ -130,7 +109,7 @@ export class CoupleApplication {
         couple.partnerBAvatarUrl = input.avatarUrl;
         couple.pendingInvitation = null;
         await couple.save();
-        return mapCoupleSummary(couple);
+        return mapCoupleSummary(couple, userId);
     }
     static async sendWorkspaceInvite(userId, input) {
         const couple = await findCoupleByUserId(userId);
@@ -170,7 +149,7 @@ export class CoupleApplication {
             sentAt: new Date(),
         };
         await couple.save();
-        return mapCoupleSummary(couple);
+        return mapCoupleSummary(couple, userId);
     }
     static async updatePreferredModel(userId, modelId) {
         const couple = await findCoupleByUserId(userId);
@@ -201,7 +180,7 @@ export class CoupleApplication {
         couple.pendingInvitation = null;
         couple.inviteCode = createInviteCode();
         await couple.save();
-        return mapCoupleSummary(couple);
+        return mapCoupleSummary(couple, userId);
     }
     static async leaveWorkspace(userId) {
         const couple = await findCoupleByUserId(userId);
@@ -251,14 +230,17 @@ export class CoupleApplication {
                 blockerReason: 'Create or join a couple workspace before opening a session.',
             };
         }
-        await clearStaleHomeworkGateIfNeeded(couple);
+        const { gate, changed } = await ensureHomeworkGateIntegrity(couple);
+        if (changed) {
+            await couple.save();
+        }
         const sessions = await SessionModel.find({ coupleId: couple._id }).sort({ createdAt: -1 }).limit(12);
         const activeSession = sessions.find((s) => s.status === 'pending' || s.status === 'live') ?? null;
         const blockerReason = !couple.partnerBUserId
             ? 'Invite the second partner before opening the room.'
-            : getSessionStartBlocker(couple.activeHomeworkGate);
+            : getSessionStartBlocker(gate);
         return {
-            couple: mapCoupleSummary(couple),
+            couple: mapCoupleSummary(couple, userId, gate),
             sessions: sessions.map(mapSessionSummary),
             models: MODEL_CATALOG,
             canStartSession: !blockerReason,

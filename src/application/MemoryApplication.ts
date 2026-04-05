@@ -6,6 +6,10 @@ import {
 import type { CoupleDocument } from '../domain/Models/Couple.js';
 import { generateEmbedding, cosineSimilarity } from '../infrastructure/Embeddings/embeddingService.js';
 import { toObjectIdString } from '../domain/Types/mirror.js';
+import {
+  getPartnerDisplayName,
+  normalizeHomeworkGateForCouple,
+} from './HomeworkGateApplication.js';
 
 const summarizeInline = (text: string, maxLength = 100): string => {
   const normalized = text.replace(/\s+/g, ' ').trim();
@@ -63,7 +67,6 @@ export class MemoryApplication {
         },
         {
           $set: {
-            memoryType: 'reflection',
             partnerRole: args.partnerRole,
             partnerName: args.partnerName,
             reflectionPrompt: args.reflectionPrompt,
@@ -119,7 +122,6 @@ export class MemoryApplication {
         },
         {
           $set: {
-            memoryType: 'session_summary',
             partnerRole: 'system',
             partnerName: 'Mirror',
             reflectionPrompt: 'session-summary',
@@ -164,7 +166,6 @@ export class MemoryApplication {
         },
         {
           $set: {
-            memoryType: 'conversation_digest',
             partnerRole: 'system',
             partnerName: 'Mirror',
             reflectionPrompt: 'conversation-digest',
@@ -356,13 +357,10 @@ export class MemoryApplication {
    * discuss at the start of the next session.
    */
   static buildCurrentReflectionsForDiscussion(couple: CoupleDocument): string {
-    const gate = couple.activeHomeworkGate;
+    const { gate } = normalizeHomeworkGateForCouple(couple);
     if (!gate || gate.assignments.length === 0) {
       return '';
     }
-
-    const partnerAName = couple.partnerAName;
-    const partnerBName = couple.partnerBName || 'Partner B';
 
     const parts: string[] = [
       '=== REFLECTIONS TO DISCUSS THIS SESSION ===',
@@ -372,36 +370,18 @@ export class MemoryApplication {
     ];
 
     for (const assignment of gate.assignments) {
+      const partnerName = getPartnerDisplayName(couple, assignment.targetPartnerRole);
       parts.push(`Assignment: "${assignment.title}"`);
+      parts.push(`Assigned to: ${partnerName}`);
       parts.push(`Description: ${assignment.description}`);
       parts.push(`Prompt: "${assignment.reflectionPrompt}"`);
       parts.push('');
 
-      for (const reflection of assignment.reflections) {
-        const isPartnerA = reflection.userId === couple.partnerAUserId;
-        const name = isPartnerA ? partnerAName : partnerBName;
-        parts.push(`  ${name} wrote (completed: ${reflection.completed}):`);
-        parts.push(`  "${reflection.reflection}"`);
-        parts.push('');
-      }
-
-      if (assignment.reflections.length === 0) {
-        parts.push('  WARNING: No reflections submitted. Call this out immediately.');
-        parts.push('');
-      }
-
-      const partnerAReflection = assignment.reflections.find(
-        (r) => r.userId === couple.partnerAUserId,
-      );
-      const partnerBReflection = assignment.reflections.find(
-        (r) => r.userId === couple.partnerBUserId,
-      );
-
-      if (!partnerAReflection) {
-        parts.push(`  ${partnerAName} DID NOT submit a reflection. Confront them about this.`);
-      }
-      if (!partnerBReflection) {
-        parts.push(`  ${partnerBName} DID NOT submit a reflection. Confront them about this.`);
+      if (assignment.submission?.reflection.trim()) {
+        parts.push(`  ${partnerName} wrote (completed: ${assignment.submission.completed}):`);
+        parts.push(`  "${assignment.submission.reflection}"`);
+      } else {
+        parts.push(`  ${partnerName} DID NOT submit a reflection. Confront them about this.`);
       }
       parts.push('');
     }
@@ -415,7 +395,7 @@ export class MemoryApplication {
       presentPartnerRole?: 'partner_a' | 'partner_b';
     },
   ): string {
-    const gate = couple.activeHomeworkGate;
+    const { gate } = normalizeHomeworkGateForCouple(couple);
     if (!gate || gate.assignments.length === 0) {
       return '';
     }
@@ -423,31 +403,21 @@ export class MemoryApplication {
     const describePartner = (
       partnerRole: 'partner_a' | 'partner_b',
       partnerName: string,
-      userId?: string,
     ): string => {
-      if (!userId) {
-        return '';
-      }
-
-      const partnerAssignments = gate.assignments.slice(0, 2).map((assignment) => {
-        const reflection = assignment.reflections.find((entry) => entry.userId === userId);
-        if (!reflection?.reflection.trim()) {
-          return `${assignment.title}: no reflection submitted`;
-        }
-
-        return `${assignment.title}: "${summarizeInline(reflection.reflection, 88)}"`;
-      });
-
-      if (partnerAssignments.length === 0) {
+      const assignment = gate.assignments.find((entry) => entry.targetPartnerRole === partnerRole);
+      if (!assignment) {
         return `${partnerName}, there is no saved homework from you yet.`;
       }
 
-      const prefix = partnerRole === 'partner_a' ? `${partnerName}, you wrote` : `${partnerName}, you wrote`;
-      return `${prefix} ${partnerAssignments.join('; ')}.`;
+      if (!assignment.submission?.reflection.trim()) {
+        return `${partnerName}, you have not submitted your reflection for "${assignment.title}" yet.`;
+      }
+
+      return `${partnerName}, you wrote ${assignment.title}: "${summarizeInline(assignment.submission.reflection, 88)}".`;
     };
 
-    const partnerALine = describePartner('partner_a', couple.partnerAName, couple.partnerAUserId);
-    const partnerBLine = describePartner('partner_b', couple.partnerBName || 'Partner B', couple.partnerBUserId);
+    const partnerALine = describePartner('partner_a', couple.partnerAName);
+    const partnerBLine = describePartner('partner_b', couple.partnerBName || 'Partner B');
 
     if (options?.presentPartnerRole === 'partner_a') {
       return `${partnerALine} We start there, and we wait for ${couple.partnerBName || 'your partner'} before we move on.`;

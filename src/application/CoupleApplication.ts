@@ -4,12 +4,12 @@ import { UserProfileModel } from '../domain/Models/UserProfile.js';
 import {
   createInviteCode,
   getSessionStartBlocker,
-  isMeaningfulSessionAttempt,
 } from '../domain/Rules/sessionRules.js';
 import {
   DEFAULT_MODEL_ID,
   MODEL_CATALOG,
   getModelOption,
+  type HomeworkGate,
   toObjectIdString,
   type CoupleSummary,
   type CreateCoupleInput,
@@ -25,6 +25,10 @@ import {
   canSendWorkspaceInvitationEmails,
   sendWorkspaceInvitationEmail,
 } from '../infrastructure/Email/workspaceInviteMailer.js';
+import {
+  ensureHomeworkGateIntegrity,
+  mapHomeworkGateSummaryForUser,
+} from './HomeworkGateApplication.js';
 
 const findCoupleByUserId = async (userId: string): Promise<CoupleDocument | null> =>
   CoupleModel.findOne({
@@ -68,7 +72,11 @@ const buildInvitationUrl = (
   return url.toString();
 };
 
-export const mapCoupleSummary = (couple: CoupleDocument): CoupleSummary => ({
+export const mapCoupleSummary = (
+  couple: CoupleDocument,
+  viewerUserId: string,
+  activeHomeworkGate?: HomeworkGate | null,
+): CoupleSummary => ({
   id: toObjectIdString(couple._id),
   inviteCode: couple.inviteCode,
   preferredModel: couple.preferredModel,
@@ -85,7 +93,7 @@ export const mapCoupleSummary = (couple: CoupleDocument): CoupleSummary => ({
       }
     : undefined,
   memorySummary: couple.memorySummary,
-  activeHomeworkGate: couple.activeHomeworkGate ?? null,
+  activeHomeworkGate: mapHomeworkGateSummaryForUser(couple, viewerUserId, activeHomeworkGate),
   pendingInvitation: couple.pendingInvitation ?? null,
 });
 
@@ -103,33 +111,6 @@ const mapSessionSummary = (session: SessionDocument): SessionSummary => ({
   interventions: session.interventions,
   metrics: session.metrics,
 });
-
-const clearStaleHomeworkGateIfNeeded = async (couple: CoupleDocument): Promise<void> => {
-  const gate = couple.activeHomeworkGate;
-  if (!gate) {
-    return;
-  }
-
-  const sourceSession = await SessionModel.findById(gate.sourceSessionId);
-  if (!sourceSession) {
-    couple.activeHomeworkGate = null;
-    await couple.save();
-    return;
-  }
-
-  const isMeaningful = isMeaningfulSessionAttempt({
-    transcriptSegments: sourceSession.transcriptSegments,
-    interventions: sourceSession.interventions,
-    metrics: sourceSession.metrics,
-  });
-
-  if (isMeaningful) {
-    return;
-  }
-
-  couple.activeHomeworkGate = null;
-  await couple.save();
-};
 
 export class CoupleApplication {
   static async createCouple(userId: string, input: CreateCoupleInput): Promise<CoupleSummary> {
@@ -152,7 +133,7 @@ export class CoupleApplication {
       pendingInvitation: null,
     });
 
-    return mapCoupleSummary(couple);
+    return mapCoupleSummary(couple, userId);
   }
 
   static async joinCouple(userId: string, input: JoinCoupleInput): Promise<CoupleSummary> {
@@ -181,7 +162,7 @@ export class CoupleApplication {
     couple.pendingInvitation = null;
     await couple.save();
 
-    return mapCoupleSummary(couple);
+    return mapCoupleSummary(couple, userId);
   }
 
   static async sendWorkspaceInvite(
@@ -237,7 +218,7 @@ export class CoupleApplication {
     };
     await couple.save();
 
-    return mapCoupleSummary(couple);
+    return mapCoupleSummary(couple, userId);
   }
 
   static async updatePreferredModel(userId: string, modelId: string): Promise<ModelOption> {
@@ -274,7 +255,7 @@ export class CoupleApplication {
     couple.inviteCode = createInviteCode();
     await couple.save();
 
-    return mapCoupleSummary(couple);
+    return mapCoupleSummary(couple, userId);
   }
 
   static async leaveWorkspace(userId: string): Promise<{ leftWorkspace: true }> {
@@ -332,7 +313,10 @@ export class CoupleApplication {
       };
     }
 
-    await clearStaleHomeworkGateIfNeeded(couple);
+    const { gate, changed } = await ensureHomeworkGateIntegrity(couple);
+    if (changed) {
+      await couple.save();
+    }
 
     const sessions = await SessionModel.find({ coupleId: couple._id }).sort({ createdAt: -1 }).limit(12);
     const activeSession = sessions.find(
@@ -341,10 +325,10 @@ export class CoupleApplication {
     const blockerReason =
       !couple.partnerBUserId
         ? 'Invite the second partner before opening the room.'
-        : getSessionStartBlocker(couple.activeHomeworkGate);
+        : getSessionStartBlocker(gate);
 
     return {
-      couple: mapCoupleSummary(couple),
+      couple: mapCoupleSummary(couple, userId, gate),
       sessions: sessions.map(mapSessionSummary),
       models: MODEL_CATALOG,
       canStartSession: !blockerReason,

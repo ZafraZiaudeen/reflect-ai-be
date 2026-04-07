@@ -1,4 +1,4 @@
-import nodemailer, { type Transporter } from 'nodemailer';
+import { Resend } from 'resend';
 import { env } from '../Config/env.js';
 
 interface SendWorkspaceInvitationEmailInput {
@@ -10,28 +10,14 @@ interface SendWorkspaceInvitationEmailInput {
   signInUrl: string;
 }
 
-const hasInviteMailConfig = Boolean(
-  env.SMTP_HOST && env.SMTP_PORT && env.SMTP_USER && env.SMTP_PASS && env.SMTP_FROM,
-);
+const hasInviteMailConfig = Boolean(env.RESEND_API_KEY && env.RESEND_FROM);
 
-let transporter: Transporter | null = null;
+let resend: Resend | null = null;
 
-const getTransporter = (): Transporter => {
-  if (transporter) {
-    return transporter;
-  }
-
- transporter = nodemailer.createTransport({
-  host: env.SMTP_HOST,
-  port: env.SMTP_PORT,
-  secure: env.SMTP_PORT === 465,
-  family: 4,   
-  auth: {
-    user: env.SMTP_USER,
-    pass: env.SMTP_PASS,
-  },
-});
-  return transporter;
+const getResend = (): Resend => {
+  if (resend) return resend;
+  resend = new Resend(env.RESEND_API_KEY);
+  return resend;
 };
 
 export const canSendWorkspaceInvitationEmails = (): boolean => hasInviteMailConfig;
@@ -40,7 +26,12 @@ export const sendWorkspaceInvitationEmail = async (
   input: SendWorkspaceInvitationEmailInput,
 ): Promise<void> => {
   if (!hasInviteMailConfig) {
-    throw new Error('SMTP invite email is not configured.');
+    throw new Error('Resend email is not configured.');
+  }
+
+  const fromAddress = env.RESEND_FROM;
+  if (!fromAddress) {
+    throw new Error('Resend sender address is not configured.');
   }
 
   const greeting = input.recipientName ? `Hi ${input.recipientName},` : 'Hi,';
@@ -99,11 +90,15 @@ export const sendWorkspaceInvitationEmail = async (
     </div>
   `;
 
-  await getTransporter().sendMail({
-    from: env.SMTP_FROM,
+  const { error } = await getResend().emails.send({
+    from: fromAddress,
     to: input.toEmail,
     subject,
     text,
     html,
   });
+
+  if (error) {
+    throw new Error(`Failed to send invitation email: ${error.message}`);
+  }
 };

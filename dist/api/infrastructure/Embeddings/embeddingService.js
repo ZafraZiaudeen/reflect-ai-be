@@ -2,11 +2,11 @@ import { createHash } from 'node:crypto';
 import { InferenceClient } from '@huggingface/inference';
 import { env } from '../Config/env.js';
 import { recordClassificationRuntime, recordEmbeddingRuntime, } from '../Runtime/runtimeStatus.js';
+import { createOpenRouterClient } from '../OpenRouter/openRouterService.js';
 /* ------------------------------------------------------------------ */
 /*  Models                                                              */
 /* ------------------------------------------------------------------ */
 const EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2';
-const CLASSIFICATION_MODEL = 'facebook/bart-large-mnli';
 export const EMBEDDING_DIMENSIONS = 384;
 /* ------------------------------------------------------------------ */
 /*  HuggingFace client singleton                                       */
@@ -199,11 +199,13 @@ export const generateEmbedding = async (text) => {
     };
 };
 /* ------------------------------------------------------------------ */
-/*  Honesty analysis via zero-shot classification                      */
+/*  Honesty analysis via OpenRouter LLM classification                 */
 /*                                                                      */
-/*  Uses HuggingFace free inference API (facebook/bart-large-mnli)     */
-/*  to classify utterances into honesty-related categories.            */
+/*  Uses a fast OpenRouter model to classify utterances into            */
+/*  honesty-related categories, replacing the unreliable HuggingFace   */
+/*  free inference API.                                                 */
 /* ------------------------------------------------------------------ */
+const HONESTY_CLASSIFICATION_MODEL = 'google/gemini-2.5-flash';
 const HONESTY_LABELS = [
     'taking accountability and being honest',
     'genuine engagement and vulnerability',
@@ -220,6 +222,28 @@ const HONESTY_WEIGHTS = {
     'denying responsibility': -30,
     'stonewalling or withdrawing': -20,
 };
+const SINGLE_UTTERANCE_SYSTEM_PROMPT = [
+    'You are a couples therapy utterance classifier.',
+    'Given a single utterance from a therapy session, classify it against these labels by estimating the probability (0-1) that the utterance belongs to each category. Probabilities should sum to approximately 1.',
+    '',
+    'Labels:',
+    ...HONESTY_LABELS.map((l) => `- ${l}`),
+    '',
+    'Respond with ONLY valid JSON in this exact format:',
+    '{"labels":["label1","label2",...],"scores":[0.4,0.25,...]}',
+    'Order labels from highest to lowest score.',
+].join('\n');
+const BATCH_SYSTEM_PROMPT = [
+    'You are a couples therapy utterance classifier.',
+    'Given a list of utterances from a therapy session (each with an index and speaker), classify each utterance against these labels by estimating the probability (0-1) that the utterance belongs to each category.',
+    '',
+    'Labels:',
+    ...HONESTY_LABELS.map((l) => `- ${l}`),
+    '',
+    'Respond with ONLY valid JSON — an array of objects, one per utterance, in the same order:',
+    '[{"index":0,"labels":["label1","label2",...],"scores":[0.4,0.25,...]},...]',
+    'Within each object, order labels from highest to lowest score.',
+].join('\n');
 /**
  * Analyze a single utterance for honesty indicators.
  * Returns a score from 1-100 and the dominant label.
@@ -229,54 +253,63 @@ export const analyzeHonesty = async (text) => {
     if (!trimmed || trimmed.split(/\s+/).length < 3) {
         return { score: 50, label: 'unknown', confidence: 0, breakdown: {} };
     }
+    if (!env.OPENROUTER_API_KEY) {
+        return { score: 50, label: 'unknown', confidence: 0, breakdown: {} };
+    }
     try {
-        const client = getHfClient();
-        const result = await client.zeroShotClassification({
-            accessToken: env.HUGGINGFACE_API_KEY || undefined,
-            model: CLASSIFICATION_MODEL,
-            endpointUrl: env.HUGGINGFACE_CLASSIFICATION_ENDPOINT || undefined,
-            provider: 'hf-inference',
-            inputs: trimmed,
-            parameters: { candidate_labels: HONESTY_LABELS },
+        const client = createOpenRouterClient();
+        const response = await client.chat.completions.create({
+            model: HONESTY_CLASSIFICATION_MODEL,
+            temperature: 0.1,
+            max_tokens: 256,
+            messages: [
+                { role: 'system', content: SINGLE_UTTERANCE_SYSTEM_PROMPT },
+                { role: 'user', content: trimmed },
+            ],
         });
-        // Handle the response — may be a single result or an array
-        const rawClassification = Array.isArray(result) ? result[0] : result;
-        const classification = rawClassification;
-        const labels = classification?.labels;
-        const scores = classification?.scores;
-        if (!labels || !scores || labels.length === 0) {
+        const raw = response.choices?.[0]?.message?.content?.trim() ?? '';
+        const jsonStr = raw.startsWith('{') ? raw : raw.match(/\{[\s\S]*\}/)?.[0];
+        if (!jsonStr) {
             return { score: 50, label: 'unknown', confidence: 0, breakdown: {} };
         }
-        // Build score from weighted combination of all labels
-        const breakdown = {};
-        let weightedSum = 0;
-        for (let i = 0; i < labels.length; i++) {
-            const label = labels[i];
-            const probability = scores[i] ?? 0;
-            breakdown[label] = probability;
-            weightedSum += probability * (HONESTY_WEIGHTS[label] ?? 0);
-        }
-        // Center around 50, then clamp to [1, 100]
-        const score = Math.max(1, Math.min(100, Math.round(50 + weightedSum)));
-        return {
-            score,
-            label: labels[0] || 'unknown',
-            confidence: scores[0] || 0,
-            breakdown,
-        };
+        const parsed = JSON.parse(jsonStr);
+        return computeHonestyScore(parsed.labels, parsed.scores);
     }
     catch (error) {
-        const failure = classifyHfFailure(error);
-        console.warn(`[honesty] Hugging Face zero-shot classification failed (${failure.type}). Using neutral fallback score.`, error);
+        console.warn('[honesty] OpenRouter classification failed. Using neutral fallback score.', error);
         recordClassificationRuntime({
-            failureType: failure.type,
-            failureMessage: failure.message,
+            failureType: 'transient',
+            failureMessage: error instanceof Error ? error.message : String(error),
         });
         return { score: 50, label: 'unknown', confidence: 0, breakdown: {} };
     }
 };
 /**
+ * Compute honesty score from label probabilities.
+ */
+const computeHonestyScore = (labels, scores) => {
+    if (!labels || !scores || labels.length === 0) {
+        return { score: 50, label: 'unknown', confidence: 0, breakdown: {} };
+    }
+    const breakdown = {};
+    let weightedSum = 0;
+    for (let i = 0; i < labels.length; i++) {
+        const label = labels[i];
+        const probability = scores[i] ?? 0;
+        breakdown[label] = probability;
+        weightedSum += probability * (HONESTY_WEIGHTS[label] ?? 0);
+    }
+    const score = Math.max(1, Math.min(100, Math.round(50 + weightedSum)));
+    return {
+        score,
+        label: labels[0] || 'unknown',
+        confidence: scores[0] || 0,
+        breakdown,
+    };
+};
+/**
  * Analyze a batch of utterances and return an aggregate honesty score.
+ * Uses a single LLM call for efficiency.
  * Used at session end for the final validated score.
  */
 export const analyzeSessionHonesty = async (utterances) => {
@@ -291,30 +324,59 @@ export const analyzeSessionHonesty = async (utterances) => {
     if (sampled.length === 0) {
         return { score: 50, perSpeaker: {} };
     }
-    const speakerScores = {};
-    // Analyze in small batches to respect rate limits
-    for (const utterance of sampled) {
-        const result = await analyzeHonesty(utterance.text);
-        if (!speakerScores[utterance.speaker]) {
-            speakerScores[utterance.speaker] = [];
+    if (!env.OPENROUTER_API_KEY) {
+        return { score: 50, perSpeaker: {} };
+    }
+    try {
+        const client = createOpenRouterClient();
+        const userContent = sampled
+            .map((u, i) => `[${i}] ${u.speaker}: ${u.text}`)
+            .join('\n');
+        const response = await client.chat.completions.create({
+            model: HONESTY_CLASSIFICATION_MODEL,
+            temperature: 0.1,
+            max_tokens: 2048,
+            messages: [
+                { role: 'system', content: BATCH_SYSTEM_PROMPT },
+                { role: 'user', content: userContent },
+            ],
+        });
+        const raw = response.choices?.[0]?.message?.content?.trim() ?? '';
+        const jsonStr = raw.startsWith('[') ? raw : raw.match(/\[[\s\S]*\]/)?.[0];
+        if (!jsonStr) {
+            return { score: 50, perSpeaker: {} };
         }
-        speakerScores[utterance.speaker].push(result.score);
-        // Brief delay between requests to avoid rate limiting
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        const parsed = JSON.parse(jsonStr);
+        const speakerScores = {};
+        for (let i = 0; i < parsed.length; i++) {
+            const entry = parsed[i];
+            const idx = entry.index ?? i;
+            const utterance = sampled[idx];
+            if (!utterance)
+                continue;
+            const result = computeHonestyScore(entry.labels, entry.scores);
+            if (!speakerScores[utterance.speaker]) {
+                speakerScores[utterance.speaker] = [];
+            }
+            speakerScores[utterance.speaker].push(result.score);
+        }
+        // Compute per-speaker averages
+        const perSpeaker = {};
+        const allScores = [];
+        for (const [speaker, scores] of Object.entries(speakerScores)) {
+            const avg = Math.round(scores.reduce((sum, s) => sum + s, 0) / scores.length);
+            perSpeaker[speaker] = avg;
+            allScores.push(avg);
+        }
+        const score = allScores.length > 0
+            ? Math.round(allScores.reduce((sum, s) => sum + s, 0) / allScores.length)
+            : 50;
+        return { score: Math.max(1, Math.min(100, score)), perSpeaker };
     }
-    // Compute per-speaker averages
-    const perSpeaker = {};
-    const allScores = [];
-    for (const [speaker, scores] of Object.entries(speakerScores)) {
-        const avg = Math.round(scores.reduce((sum, s) => sum + s, 0) / scores.length);
-        perSpeaker[speaker] = avg;
-        allScores.push(avg);
+    catch (error) {
+        console.warn('[honesty] OpenRouter batch classification failed. Using neutral fallback.', error);
+        return { score: 50, perSpeaker: {} };
     }
-    // Overall score is the average across speakers
-    const score = allScores.length > 0
-        ? Math.round(allScores.reduce((sum, s) => sum + s, 0) / allScores.length)
-        : 50;
-    return { score: Math.max(1, Math.min(100, score)), perSpeaker };
 };
 /* ------------------------------------------------------------------ */
 /*  Cosine similarity (for fallback vector search without Atlas)       */

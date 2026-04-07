@@ -677,8 +677,19 @@ const saveTranscript = async (sessionId, segment) => {
 /*  Get or create a session room                                       */
 /* ------------------------------------------------------------------ */
 const getOrCreateRoom = async (sessionId) => {
-    if (activeRooms.has(sessionId)) {
-        return activeRooms.get(sessionId);
+    // If room exists in memory (including soft-closed rooms), revive it
+    const existingRoom = activeRooms.get(sessionId);
+    if (existingRoom) {
+        if (existingRoom.closed) {
+            // Revive a soft-closed room — clear cleanup timer and reopen
+            if (existingRoom.cleanupTimer) {
+                clearTimeout(existingRoom.cleanupTimer);
+                existingRoom.cleanupTimer = null;
+            }
+            existingRoom.closed = false;
+            console.info(`[voice-ws] Revived soft-closed room for session ${sessionId}`);
+        }
+        return existingRoom;
     }
     // Load session and couple from DB
     const sessionDoc = await SessionModel.findById(sessionId);
@@ -704,6 +715,8 @@ const getOrCreateRoom = async (sessionId) => {
     const initialHonestyScore = typeof sessionDoc.metrics?.honestyScore === 'number' && sessionDoc.metrics.honestyScore > 0
         ? sessionDoc.metrics.honestyScore
         : 50;
+    // Check if this is a reconnection to a previously live session (has existing transcripts)
+    const hasExistingTranscripts = sessionDoc.status === 'live' && sessionDoc.transcriptSegments?.length > 0;
     const room = {
         sessionId,
         coupleId: coupleIdStr,
@@ -728,12 +741,34 @@ const getOrCreateRoom = async (sessionId) => {
         fullReflectionHistory,
         reflectionOpeningLine,
         hasReflections,
-        sessionStarted: false,
-        reflectionKickoffDelivered: false,
+        sessionStarted: hasExistingTranscripts,
+        reflectionKickoffDelivered: hasExistingTranscripts,
         closed: false,
+        cleanupTimer: null,
     };
     // Build system prompt with full context
-    room.chatHistory = [{ role: 'system', content: buildSystemPrompt(room) }];
+    const systemMessage = [
+        { role: 'system', content: buildSystemPrompt(room) },
+    ];
+    if (hasExistingTranscripts) {
+        // Rebuild chat history from persisted transcripts
+        const rebuilt = [];
+        for (const seg of sessionDoc.transcriptSegments) {
+            if (seg.source === 'livekit-user' || seg.source === 'frontend-webspeech') {
+                rebuilt.push({ role: 'user', content: `[${seg.speakerLabel}]: ${seg.text}` });
+            }
+            else if (seg.source === 'agent-livekit') {
+                rebuilt.push({ role: 'assistant', content: seg.text });
+            }
+        }
+        // Keep system prompt + last 24 conversation messages to stay within context
+        const trimmed = rebuilt.slice(-24);
+        room.chatHistory = [...systemMessage, ...trimmed];
+        console.info(`[voice-ws] Rebuilt chat history with ${trimmed.length} messages for session ${sessionId}`);
+    }
+    else {
+        room.chatHistory = systemMessage;
+    }
     activeRooms.set(sessionId, room);
     // Mark session as live
     await SessionModel.findByIdAndUpdate(sessionId, {
@@ -775,6 +810,25 @@ export const attachVoiceWebSocket = (server) => {
     wss.on('connection', (ws, request) => {
         void handleVoiceConnection(ws, request);
     });
+    // Server-side heartbeat: ping all connections every 30s, terminate unresponsive ones
+    const heartbeatInterval = setInterval(() => {
+        for (const room of activeRooms.values()) {
+            for (const conn of room.connections.values()) {
+                if (conn.closed)
+                    continue;
+                if (!conn.isAlive) {
+                    console.info(`[voice-ws] Terminating unresponsive connection for ${conn.partnerName}`);
+                    conn.closed = true;
+                    conn.ws.terminate();
+                    continue;
+                }
+                conn.isAlive = false;
+                conn.ws.ping();
+            }
+        }
+    }, 30_000);
+    // Clean up heartbeat on server close
+    server.on('close', () => clearInterval(heartbeatInterval));
     markVoiceWebSocketAttached();
     console.info('[voice-ws] WebSocket voice pipeline attached at /api/voice');
 };
@@ -831,7 +885,12 @@ const handleVoiceConnection = async (ws, request) => {
         ws,
         deepgramStt: null,
         closed: false,
+        isAlive: true,
     };
+    // Track pong responses for heartbeat
+    ws.on('pong', () => {
+        conn.isAlive = true;
+    });
     room.connections.set(visitorId, conn);
     console.info(`[voice-ws] ${partnerName} (${partnerRole}) joined session ${sessionId}`);
     sendJson(ws, {
@@ -842,6 +901,33 @@ const handleVoiceConnection = async (ws, request) => {
         honestyScore: room.honestyScore,
         escalationLevel: room.escalationLevel,
     });
+    // If session was already started (reconnection), send conversation history
+    if (room.sessionStarted) {
+        // Build transcript history from chat messages (excluding system prompt)
+        const transcripts = room.chatHistory
+            .filter((m) => m.role !== 'system')
+            .map((m) => {
+            if (m.role === 'user') {
+                const match = m.content.match(/^\[(.+?)\]:\s*([\s\S]+)$/);
+                return {
+                    speaker: 'user',
+                    partnerName: match?.[1] || 'Partner',
+                    partnerRole: match?.[1] === room.partnerAName ? 'partner_a' : 'partner_b',
+                    text: match?.[2] || m.content,
+                };
+            }
+            return {
+                speaker: 'mirror',
+                partnerName: 'Mirror',
+                partnerRole: 'mirror',
+                text: m.content,
+            };
+        });
+        if (transcripts.length > 0) {
+            sendJson(ws, { type: 'session_history', transcripts });
+            console.info(`[voice-ws] Sent ${transcripts.length} history entries to ${partnerName}`);
+        }
+    }
     // Notify all other connections that a new partner joined
     for (const [id, otherConn] of room.connections) {
         if (id !== visitorId && !otherConn.closed) {
@@ -949,13 +1035,18 @@ const handleVoiceConnection = async (ws, request) => {
                 });
             }
         }
-        // If no connections left, abort processing and clean up room
+        // If no connections left, soft-close and schedule cleanup after 3 minutes
         const activeConns = Array.from(room.connections.values()).filter((c) => !c.closed);
         if (activeConns.length === 0) {
             room.closed = true;
             room.currentAbortController?.abort();
-            activeRooms.delete(sessionId);
-            console.info(`[voice-ws] Session room closed: ${sessionId}`);
+            console.info(`[voice-ws] All partners left session ${sessionId}. Room preserved for 3 minutes.`);
+            room.cleanupTimer = setTimeout(() => {
+                if (room.closed) {
+                    activeRooms.delete(sessionId);
+                    console.info(`[voice-ws] Session room expired and removed: ${sessionId}`);
+                }
+            }, 180_000);
         }
         else {
             console.info(`[voice-ws] ${partnerName} left session ${sessionId}. ${activeConns.length} partner(s) remaining.`);

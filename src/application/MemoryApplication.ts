@@ -24,15 +24,7 @@ const summarizeInline = (text: string, maxLength = 100): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 };
 
-/* ------------------------------------------------------------------ */
-/*  Store reflections with embeddings                                   */
-/* ------------------------------------------------------------------ */
-
 export class MemoryApplication {
-  /**
-   * Store a partner's reflection with its vector embedding.
-   * Called when a partner submits homework.
-   */
   static async storeReflection(args: {
     coupleId: string;
     sessionId: string;
@@ -92,10 +84,6 @@ export class MemoryApplication {
     }
   }
 
-  /**
-   * Store a session summary as a searchable memory entry.
-   * Called when a session completes with a truth report.
-   */
   static async storeSessionSummary(args: {
     coupleId: string;
     sessionId: string;
@@ -191,14 +179,6 @@ export class MemoryApplication {
     }
   }
 
-  /* ------------------------------------------------------------------ */
-  /*  Retrieve reflections                                               */
-  /* ------------------------------------------------------------------ */
-
-  /**
-   * Retrieve ALL reflections for a couple, ordered chronologically.
-   * This gives the AI complete knowledge of what both partners have written.
-   */
   static async getAllReflections(coupleId: string): Promise<ReflectionMemoryDocument[]> {
     return ReflectionMemoryModel.find({
       coupleId: new Types.ObjectId(coupleId),
@@ -209,9 +189,6 @@ export class MemoryApplication {
       .exec();
   }
 
-  /**
-   * Retrieve all session summaries for a couple, ordered chronologically.
-   */
   static async getAllSessionSummaries(coupleId: string): Promise<ReflectionMemoryDocument[]> {
     return ReflectionMemoryModel.find({
       coupleId: new Types.ObjectId(coupleId),
@@ -236,10 +213,6 @@ export class MemoryApplication {
       .exec();
   }
 
-  /**
-   * Semantic search: find reflections similar to a query string.
-   * Attempts Atlas $vectorSearch first, falls back to manual cosine similarity.
-   */
   static async searchSimilarReflections(args: {
     coupleId: string;
     query: string;
@@ -293,14 +266,6 @@ export class MemoryApplication {
       .slice(0, limit) as unknown as Array<ReflectionMemoryDocument & { similarity: number }>;
   }
 
-  /* ------------------------------------------------------------------ */
-  /*  Context builders for AI sessions                                   */
-  /* ------------------------------------------------------------------ */
-
-  /**
-   * Build a comprehensive, chronological reflection context that gives the AI
-   * FULL knowledge of every reflection ever written by both partners.
-   */
   static async buildReflectionContext(args: {
     coupleId: string;
     couple: CoupleDocument;
@@ -352,10 +317,6 @@ export class MemoryApplication {
     return parts.join('\n');
   }
 
-  /**
-   * Build the current homework gate reflections formatted for the AI to
-   * discuss at the start of the next session.
-   */
   static buildCurrentReflectionsForDiscussion(couple: CoupleDocument): string {
     const { gate } = normalizeHomeworkGateForCouple(couple);
     if (!gate || gate.assignments.length === 0) {
@@ -437,57 +398,18 @@ export class MemoryApplication {
       .join(' ');
   }
 
-  /**
-   * Build the enriched opening context for a new session.
-   * Combines: previous summary + ALL past reflections + session summaries +
-   * current homework reflections to discuss.
-   */
-  static async buildEnrichedOpeningContext(args: {
-    coupleId: string;
+  static buildEnrichedOpeningContext(args: {
     couple: CoupleDocument;
-    previousSummary: string;
-  }): Promise<string> {
+  }): string {
     const parts: string[] = [];
 
-    // Previous session summary
-    if (args.previousSummary) {
-      parts.push(`Previous session memory: ${args.previousSummary}`);
+    if (args.couple.memorySummary) {
+      parts.push('=== RELATIONSHIP MEMORY (all sessions summarised) ===');
+      parts.push(args.couple.memorySummary);
     } else {
-      parts.push("This is the couple's first session — no prior session memory exists yet.");
+      parts.push("This is the couple's first session — no prior memory exists yet.");
     }
 
-    // All past session summaries from vector memory
-    const sessionSummaries = await this.getAllSessionSummaries(args.coupleId);
-    if (sessionSummaries.length > 0) {
-      parts.push('');
-      parts.push('=== ALL PAST SESSION SUMMARIES ===');
-      for (let i = 0; i < sessionSummaries.length; i++) {
-        parts.push(`Session ${i + 1}: ${sessionSummaries[i].reflectionText}`);
-      }
-    }
-
-    const conversationDigests = await this.getRecentConversationDigests(args.coupleId);
-    if (conversationDigests.length > 0) {
-      parts.push('');
-      parts.push('=== RECENT CONVERSATION DIGESTS ===');
-      for (const digest of conversationDigests.reverse()) {
-        parts.push(digest.reflectionText);
-        parts.push('');
-      }
-    }
-
-    // Complete reflection history
-    const reflectionContext = await this.buildReflectionContext({
-      coupleId: args.coupleId,
-      couple: args.couple,
-    });
-
-    if (reflectionContext) {
-      parts.push('');
-      parts.push(reflectionContext);
-    }
-
-    // Current homework reflections to discuss in this session
     const currentReflections = this.buildCurrentReflectionsForDiscussion(args.couple);
     if (currentReflections) {
       parts.push('');

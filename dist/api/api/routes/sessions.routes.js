@@ -4,6 +4,7 @@ import { SessionApplication } from '../../application/SessionApplication.js';
 import { getAuthenticatedUserId } from '../../infrastructure/Auth/authentication.js';
 import { HttpError } from '../../infrastructure/Errors/HttpError.js';
 import { asyncHandler } from '../../infrastructure/Http/asyncHandler.js';
+import { updateRoomModel } from '../../infrastructure/Voice/voiceWebSocket.js';
 export const sessionsRouter = Router();
 const getRouteParam = (value, name) => {
     const nextValue = Array.isArray(value) ? value[0] : value;
@@ -39,6 +40,17 @@ sessionsRouter.patch('/:sessionId/homework', asyncHandler(async (request, respon
     const sessionId = getRouteParam(request.params.sessionId, 'sessionId');
     const couple = await SessionApplication.submitHomeworkReflection(userId, sessionId, request.body);
     response.json(couple);
+}));
+sessionsRouter.patch('/:sessionId/model', asyncHandler(async (request, response) => {
+    const userId = getAuthenticatedUserId(request);
+    const sessionId = getRouteParam(request.params.sessionId, 'sessionId');
+    const modelId = request.body?.modelId;
+    if (!modelId)
+        throw new HttpError(400, 'Missing modelId in request body.');
+    const session = await SessionApplication.updateSessionModel(userId, sessionId, modelId);
+    // Also update the live in-memory room immediately so the next utterance uses the new model.
+    updateRoomModel(sessionId, modelId);
+    response.json(session);
 }));
 sessionsRouter.post('/:sessionId/transcripts', asyncHandler(async (request, response) => {
     const userId = getAuthenticatedUserId(request);

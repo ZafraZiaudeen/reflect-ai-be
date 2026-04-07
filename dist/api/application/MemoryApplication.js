@@ -340,47 +340,21 @@ export class MemoryApplication {
             .join(' ');
     }
     /**
-     * Build the enriched opening context for a new session.
-     * Combines: previous summary + ALL past reflections + session summaries +
-     * current homework reflections to discuss.
+     * Build a lean opening context for a new session.
+     *
+     * Uses the rolling cumulative summary (couple.memorySummary) which already
+     * narrates all past sessions in a single compact paragraph — no DB fan-out needed.
+     * Appends the current homework reflections so the AI knows what to discuss first.
      */
-    static async buildEnrichedOpeningContext(args) {
+    static buildEnrichedOpeningContext(args) {
         const parts = [];
-        // Previous session summary
-        if (args.previousSummary) {
-            parts.push(`Previous session memory: ${args.previousSummary}`);
+        if (args.couple.memorySummary) {
+            parts.push('=== RELATIONSHIP MEMORY (all sessions summarised) ===');
+            parts.push(args.couple.memorySummary);
         }
         else {
-            parts.push("This is the couple's first session — no prior session memory exists yet.");
+            parts.push("This is the couple's first session — no prior memory exists yet.");
         }
-        // All past session summaries from vector memory
-        const sessionSummaries = await this.getAllSessionSummaries(args.coupleId);
-        if (sessionSummaries.length > 0) {
-            parts.push('');
-            parts.push('=== ALL PAST SESSION SUMMARIES ===');
-            for (let i = 0; i < sessionSummaries.length; i++) {
-                parts.push(`Session ${i + 1}: ${sessionSummaries[i].reflectionText}`);
-            }
-        }
-        const conversationDigests = await this.getRecentConversationDigests(args.coupleId);
-        if (conversationDigests.length > 0) {
-            parts.push('');
-            parts.push('=== RECENT CONVERSATION DIGESTS ===');
-            for (const digest of conversationDigests.reverse()) {
-                parts.push(digest.reflectionText);
-                parts.push('');
-            }
-        }
-        // Complete reflection history
-        const reflectionContext = await this.buildReflectionContext({
-            coupleId: args.coupleId,
-            couple: args.couple,
-        });
-        if (reflectionContext) {
-            parts.push('');
-            parts.push(reflectionContext);
-        }
-        // Current homework reflections to discuss in this session
         const currentReflections = this.buildCurrentReflectionsForDiscussion(args.couple);
         if (currentReflections) {
             parts.push('');

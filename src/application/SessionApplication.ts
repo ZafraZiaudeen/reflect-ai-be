@@ -14,7 +14,7 @@ import {
   type SessionSummary,
 } from '../domain/Types/mirror.js';
 import { HttpError } from '../infrastructure/Errors/HttpError.js';
-import { generateTruthReport } from '../infrastructure/OpenRouter/openRouterService.js';
+import { generateCumulativeSummary, generateTruthReport } from '../infrastructure/OpenRouter/openRouterService.js';
 import { MemoryApplication } from './MemoryApplication.js';
 import { analyzeSessionHonesty } from '../infrastructure/Embeddings/embeddingService.js';
 import { mapCoupleSummary } from './CoupleApplication.js';
@@ -141,18 +141,9 @@ export class SessionApplication {
     couple.preferredModel = model.id;
     await couple.save();
 
-    // Build enriched opening context using vector memory (all past reflections + sessions)
-    let openingContext: string;
-    try {
-      openingContext = await MemoryApplication.buildEnrichedOpeningContext({
-        coupleId: toObjectIdString(couple._id),
-        couple,
-        previousSummary: couple.memorySummary,
-      });
-    } catch (error) {
-      console.warn('[session] Failed to build enriched context, falling back to basic:', error);
-      openingContext = buildSessionContextSummary(couple.memorySummary, couple.activeHomeworkGate);
-    }
+    // Build opening context from the rolling cumulative summary + current homework reflections.
+    // This is now synchronous and lean — no vector DB fan-out on session creation.
+    const openingContext = MemoryApplication.buildEnrichedOpeningContext({ couple });
 
     const session = await SessionModel.create({
       coupleId: couple._id,
@@ -357,6 +348,28 @@ export class SessionApplication {
     return mapCoupleSummary(refreshedCouple, userId, refreshedCouple.activeHomeworkGate ?? refreshedGate);
   }
 
+  static async updateSessionModel(userId: string, sessionId: string, modelId: string): Promise<SessionSummary> {
+    const couple = await findCoupleByUserId(userId);
+    if (!couple) throw new HttpError(404, 'Couple workspace not found.');
+
+    const session = await SessionModel.findOne({
+      _id: sessionId,
+      coupleId: couple._id,
+      status: { $ne: 'completed' },
+    });
+    if (!session) throw new HttpError(404, 'Active session not found.');
+
+    const model = getModelOption(modelId);
+    session.selectedModel = model.id;
+    await session.save();
+
+    // Also persist as the couple preferred model so next new session inherits it.
+    couple.preferredModel = model.id;
+    await couple.save();
+
+    return mapSessionSummary(session);
+  }
+
   static async completeSession(userId: string, sessionId: string): Promise<SessionSummary> {
     const couple = await findCoupleByUserId(userId);
     if (!couple) {
@@ -441,7 +454,26 @@ export class SessionApplication {
       session.agentDispatchRequestedAt = undefined;
       await session.save();
 
-      couple.memorySummary = report.truthSummary;
+      // Build rolling cumulative summary that narrates all sessions to date.
+      // This replaces loading every past session individually next time.
+      let cumulativeSummary = report.truthSummary;
+      try {
+        cumulativeSummary = await generateCumulativeSummary({
+          existingSummary: couple.memorySummary || '',
+          newSession: {
+            coreConflict: report.coreConflict,
+            truthSummary: report.truthSummary,
+            observedPatterns: report.observedPatterns,
+            nextGoal: report.nextGoal,
+            homeworkTitles: report.homework.map((h) => h.title),
+          },
+          selectedModel: session.selectedModel,
+        });
+      } catch (error) {
+        console.warn('[session] Cumulative summary generation failed, using plain truth summary:', error);
+      }
+
+      couple.memorySummary = cumulativeSummary;
       couple.activeHomeworkGate = {
         sourceSessionId: toObjectIdString(session._id),
         createdAt: new Date(),

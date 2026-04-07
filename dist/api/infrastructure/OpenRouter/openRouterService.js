@@ -179,3 +179,70 @@ export const generateTruthReport = async ({ selectedModel, transcriptSegments, i
     }
     return normalizeTruthReport({}, transcriptSegments, interventions, previousSummary);
 };
+/**
+ * Generate a compact rolling cumulative summary that narrates the couple's full
+ * therapy arc to date. Called after every completed session so the next session
+ * gets a single, lean paragraph instead of loading every past session individually.
+ *
+ * @param existingSummary - The current rolling summary stored in couple.memorySummary
+ * @param newSession - Key facts from the session that just ended
+ * @param selectedModel - Model to use for generation
+ */
+export const generateCumulativeSummary = async ({ existingSummary, newSession, selectedModel, }) => {
+    if (!env.OPENROUTER_API_KEY) {
+        return buildFallbackCumulativeSummary(existingSummary, newSession);
+    }
+    const client = createOpenRouterClient({ defaultMaxTokens: 400 });
+    const systemPrompt = [
+        'You maintain a concise running memory for a couples therapy program.',
+        'You will receive the existing memory and new information from the session that just ended.',
+        'Output ONLY a single updated memory paragraph (2-4 sentences, max 280 words).',
+        'This memory will be read aloud by the therapist AI at the start of the next session.',
+        'Write in plain spoken prose. No bullet points, no headers, no markdown.',
+        'Capture: the recurring core conflict, any meaningful shifts or breakthroughs, patterns still unresolved,',
+        'and the homework assigned. Fold the new session into the existing narrative — do not repeat history,',
+        'just update it.',
+    ].join(' ');
+    const userContent = [
+        existingSummary
+            ? `Existing memory:\n${existingSummary}`
+            : 'This is the first session. There is no prior memory.',
+        '',
+        'New session:',
+        `Core conflict: ${newSession.coreConflict}`,
+        `What emerged: ${newSession.truthSummary}`,
+        `Patterns observed: ${newSession.observedPatterns.join(', ') || 'none named'}`,
+        `Goal for next session: ${newSession.nextGoal}`,
+        `Homework assigned: ${newSession.homeworkTitles.join(' | ') || 'none'}`,
+    ].join('\n');
+    for (const model of getModelAttemptOrder(selectedModel, { preferReportModel: true })) {
+        try {
+            const response = await client.chat.completions.create({
+                model: model.id,
+                temperature: 0.3,
+                max_tokens: 400,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userContent },
+                ],
+            });
+            const text = response.choices?.[0]?.message?.content?.trim();
+            if (text)
+                return text;
+        }
+        catch {
+            continue;
+        }
+    }
+    return buildFallbackCumulativeSummary(existingSummary, newSession);
+};
+const buildFallbackCumulativeSummary = (existingSummary, newSession) => {
+    const parts = [];
+    if (existingSummary)
+        parts.push(existingSummary);
+    parts.push(`In the most recent session, the core conflict was: ${newSession.coreConflict}. ${newSession.truthSummary} The goal for the next session is: ${newSession.nextGoal}.`);
+    if (newSession.homeworkTitles.length > 0) {
+        parts.push(`Homework assigned: ${newSession.homeworkTitles.join(', ')}.`);
+    }
+    return parts.join(' ');
+};

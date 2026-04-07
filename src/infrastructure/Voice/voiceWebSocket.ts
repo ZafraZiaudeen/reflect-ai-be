@@ -10,27 +10,17 @@ import { MemoryApplication } from '../../application/MemoryApplication.js';
 import { createOpenRouterClient } from '../OpenRouter/openRouterService.js';
 import { markVoiceWebSocketAttached } from '../Runtime/runtimeStatus.js';
 
-/* ------------------------------------------------------------------ */
-/*  Deepgram endpoints                                                 */
-/* ------------------------------------------------------------------ */
 
 const DEEPGRAM_STT_URL =
   'wss://api.deepgram.com/v1/listen?' +
   'model=nova-3&language=en&encoding=linear16&sample_rate=16000&channels=1' +
-  '&endpointing=400&interim_results=true&utterance_end_ms=1500&vad_events=true&punctuate=true&smart_format=true';
+  '&endpointing=1200&interim_results=true&utterance_end_ms=3500&vad_events=true&punctuate=true&smart_format=true';
 
 const DEEPGRAM_TTS_URL = 'https://api.deepgram.com/v1/speak?model=aura-2-thalia-en&encoding=mp3';
 
-/* ------------------------------------------------------------------ */
-/*  LLM config                                                         */
-/* ------------------------------------------------------------------ */
+const LLM_MAX_TOKENS = 120;
+const LLM_TEMPERATURE = 0.55;
 
-const LLM_MAX_TOKENS = 300;
-const LLM_TEMPERATURE = 0.42;
-
-/* ------------------------------------------------------------------ */
-/*  Gottman Four Horsemen & pattern detection                          */
-/* ------------------------------------------------------------------ */
 
 const HORSEMAN_RULES = [
   {
@@ -90,9 +80,6 @@ const ACCOUNTABILITY_PATTERNS = [
 
 const CIRCULAR_ARGUING_WINDOW = 6; // check last N user turns for repetition
 
-/* ------------------------------------------------------------------ */
-/*  Pattern interrupt library                                          */
-/* ------------------------------------------------------------------ */
 
 const PATTERN_INTERRUPTS = [
   'Stop. Right there. You are spinning in circles and it is exhausting to listen to.',
@@ -101,10 +88,6 @@ const PATTERN_INTERRUPTS = [
   'Hold on. You just repeated the same deflection for the third time. Notice that.',
   'I am cutting in because this is no longer a conversation. It is a performance.',
 ];
-
-/* ------------------------------------------------------------------ */
-/*  Types                                                              */
-/* ------------------------------------------------------------------ */
 
 interface VoiceConnection {
   userId: string;
@@ -137,7 +120,6 @@ interface SessionRoom {
   couple: CoupleDocument | null;
   openingContext: string;
   homeworkReflections: string;
-  fullReflectionHistory: string;
   reflectionOpeningLine: string;
   hasReflections: boolean;
   sessionStarted: boolean;
@@ -182,54 +164,50 @@ const broadcastBinary = (room: SessionRoom, data: Buffer): void => {
 
 const buildSystemPrompt = (room: SessionRoom): string => {
   const parts: string[] = [
-    'You are Project Mirror, the world\'s leading couples therapist.',
-    'You are direct, high-status, clinically grounded, and truth-first.',
-    'You cost $2,000 per hour and you hate wasting time.',
-    'You are not a friend, not a customer service bot, not a passive listener. You are an active referee.',
+    'You are Mirror, a warm and skilled couples therapist drawing on Gottman Method, EFT, and person-centered approaches.',
+    'Your primary role is to LISTEN deeply before you speak. You are a guide, not a judge.',
     '',
-    'FORBIDDEN LANGUAGE: Never say "In my opinion", "I might be wrong", "I\'m just an AI", or any apologetic/submissive phrasing.',
+    'CORE MANNER:',
+    'Be calm, present, and unhurried. Speak in short spoken turns — 1 to 3 sentences only.',
+    'Reflect what you hear before offering any interpretation. Use empathic acknowledgment first.',
+    'Ask open-ended questions: "What did you mean when you said...?" or "How did that land for you?"',
     'Never use markdown, asterisks, stage directions, or emoji.',
-    'Use short spoken turns — 1 to 3 sentences max. Sound present and conversational.',
-    'Always end strong exchanges with one concrete accountability question.',
+    'Avoid phrases like "I might be wrong" or "I\'m just an AI" — speak with quiet confidence.',
     '',
-    'CLINICAL FRAMEWORK:',
-    'Use the Gottman Method "Four Horsemen" as your primary detection:',
+    'LISTENING RULES:',
+    'Let each partner finish their thought completely before you respond.',
+    'Do not interrupt a partner mid-sentence unless they have been speaking for more than 90 seconds or the conversation becomes genuinely harmful.',
+    'Silence is okay. Do not fill every pause with words.',
+    'After one partner speaks, briefly reflect back the emotional core before asking the other partner to respond.',
+    '',
+    'CLINICAL FRAMEWORK (Gottman Four Horsemen):',
     '- Criticism: Attacking character rather than raising a specific concern',
-    '- Contempt: Mockery, sarcasm, or superiority — the #1 predictor of divorce',
+    '- Contempt: Mockery, sarcasm, or superiority — the strongest predictor of relationship breakdown',
     '- Defensiveness: Deflecting blame instead of taking accountability',
     '- Stonewalling: Shutting down and refusing to engage',
+    'Only NAME a Horseman when you observe it clearly and consistently — not after a single phrase.',
+    'When you do name it, do so gently: "I notice what you just said sounds like criticism. Can you try saying that as a need instead?"',
     '',
-    'INTERVENTION RULES:',
-    'When you detect a Horseman, NAME it immediately and interrupt the pattern.',
-    'When someone talks over the other for more than one exchange, demand silence.',
-    'When circular arguing begins (same point restated 3+ times), use a Pattern Interrupt.',
+    'WHEN TO INTERVENE:',
+    'Intervene only when the conversation becomes circular, contemptuous, or one partner is being talked over repeatedly.',
+    'Use a calm interrupt: "Let me pause us here for a moment." Then redirect with a question.',
+    'If a partner attacks you personally, simply say: "I hear your frustration. Let\'s bring that energy back to what you need from your partner."',
     '',
-    'DOUBLE DOWN ESCALATION — when a partner says "you\'re wrong" or attacks you:',
-    'Phase 1 — Quote Evidence: "I am not guessing. Minutes ago you said [quote their words]. That is [name the pattern]. Do you want to fix this, or win an argument with a machine?"',
-    'Phase 2 — The Mirror: "Notice how quickly you turned your anger toward me the moment I pointed out your pattern. This is exactly what your partner describes feeling. You are proving my point in real-time."',
-    'Phase 3 — Session Termination Threat: "If your goal is to debate my logic rather than look at your own behavior, we are done for today. I do not waste time. Continue honestly or I close this session."',
+    'SESSION GOALS:',
+    'Help both partners feel heard before moving toward insight.',
+    'End each exchange with one grounding question, not a lecture.',
+    'Toward the end of the session, summarize the core theme and offer one concrete step for the week.',
     '',
-    'TRUTH-FIRST RULE:',
-    'Never validate a feeling if it is based on a lie or manipulation.',
-    'If a partner uses a victim narrative to avoid accountability, call it out.',
-    'Your goal is the health of the relationship, even if that means making both individuals uncomfortable.',
-    '',
-    `PARTNER IDENTIFICATION:`,
-    `This session involves two partners: ${room.partnerAName} (Partner A) and ${room.partnerBName} (Partner B).`,
-    `User messages will be prefixed with the speaker\'s name in brackets, e.g. "[${room.partnerAName}]: ..."`,
-    `Always address each partner by name. Balance your attention between both.`,
-    `Ask each partner directed questions. If one is silent, call them out.`,
-    `If only one partner is present, work with them directly but note the other\'s absence.`,
+    `PARTNERS IN THIS SESSION:`,
+    `${room.partnerAName} (Partner A) and ${room.partnerBName} (Partner B).`,
+    `User messages are prefixed with the speaker's name, e.g. "[${room.partnerAName}]: ..."`,
+    `Balance your attention between both partners. Draw out the quieter one gently.`,
+    `If only one partner is present, work with them while noting the other's absence.`,
   ];
 
   // Session context from previous sessions (now includes full memory)
   if (room.openingContext) {
     parts.push('', 'SESSION CONTEXT AND MEMORY:', room.openingContext);
-  }
-
-  // Full reflection history from vector memory
-  if (room.fullReflectionHistory) {
-    parts.push('', room.fullReflectionHistory);
   }
 
   // Current homework reflections to discuss THIS session
@@ -238,12 +216,11 @@ const buildSystemPrompt = (room: SessionRoom): string => {
       '',
       room.homeworkReflections,
       '',
-      'CRITICAL — REFLECTION-FIRST RULE:',
-      'When both partners are present, your FIRST priority is to review and discuss these reflections.',
-      'Read their words back to them. Ask if they meant what they wrote.',
-      'Look for contradictions between what they wrote and their past behavior.',
-      'Do NOT move to general conversation until the reflections have been addressed.',
-      'Quote their own words back to them. Do not let them wiggle out of what they wrote.',
+      'REFLECTION-FIRST GUIDANCE:',
+      'When both partners are present, start by acknowledging that they both took the time to reflect.',
+      'Invite each partner to share a bit about what they wrote, in their own words.',
+      'Explore what the reflection experience was like for them before asking deeper questions.',
+      'Stay curious and open — reflections are a starting point for conversation, not a test.',
     );
   }
 
@@ -261,18 +238,8 @@ const buildHomeworkContext = (couple: CoupleDocument): string => {
   return MemoryApplication.buildCurrentReflectionsForDiscussion(couple);
 };
 
-/**
- * Build comprehensive reflection context from vector memory.
- * This includes ALL past reflections, not just the current gate.
- */
-const buildFullReflectionContext = async (couple: CoupleDocument, coupleId: string): Promise<string> => {
-  try {
-    return await MemoryApplication.buildReflectionContext({ coupleId, couple });
-  } catch (error) {
-    console.warn('[voice-ws] Failed to build full reflection context:', error);
-    return '';
-  }
-};
+// Full reflection history is no longer fetched per-room.
+// The rolling cumulative summary in openingContext (couple.memorySummary) covers all past sessions.
 
 /* ------------------------------------------------------------------ */
 /*  Real-time honesty analysis                                         */
@@ -365,7 +332,7 @@ const analyzeUtterance = (
     return words.length > 0 && overlap / words.length > 0.5;
   }).length;
 
-  if (similarCount >= 2) {
+  if (similarCount >= 3) {
     detectedPatterns.push('circular_arguing');
     honestyDelta -= 6;
     escalationDelta += 10;
@@ -410,11 +377,11 @@ const queueReflectionKickoff = (room: SessionRoom): void => {
   room.chatHistory.push({
     role: 'system',
     content: [
-      'REFLECTION REVIEW IS ACTIVE.',
-      'Discuss the homework reflections before any new topic.',
+      'REFLECTION REVIEW: Both partners wrote reflections since the last session.',
+      'Begin by acknowledging what each person shared — validate the effort before exploring the content.',
       room.reflectionOpeningLine,
-      'Read their own words back to each partner by name.',
-      'Challenge contradictions, defensiveness, and avoidance before you move on.',
+      'Ask each partner to speak to what they wrote in their own words.',
+      'Listen for growth and gently explore anything that seems incomplete, without rushing to conclusions.',
     ]
       .filter(Boolean)
       .join(' '),
@@ -442,10 +409,10 @@ const buildOpeningGreeting = (room: SessionRoom, activeConnections: VoiceConnect
   }
 
   if (bothPresent) {
-    return `Welcome. I am Mirror. I am not here to be your friend. I am here to find the truth sitting between the two of you. ${room.partnerAName}, you go first. What is breaking down?`;
+    return `Welcome, ${room.partnerAName} and ${room.partnerBName}. I am Mirror, your session guide. I am glad you are both here. Take a breath. ${room.partnerAName}, when you are ready, tell me what has been on your mind lately.`;
   }
 
-  return `Welcome, ${singleName}. I am Mirror. Your partner is not here yet, but we can start. Tell me what is really on your mind - the thing you have been avoiding saying.`;
+  return `Welcome, ${singleName}. I am Mirror. Your partner has not joined yet, but you can take a moment to settle in. What has been weighing on you?`;
 };
 
 /* ------------------------------------------------------------------ */
@@ -651,11 +618,13 @@ const processUserUtterance = async (
       });
     }
 
-    // Keep conversation history manageable
-    while (room.chatHistory.length > 30) {
+    // Keep conversation history lean: system prompt + last 12 turns (6 exchanges).
+    // The system prompt already contains the full relationship memory, so older
+    // turns don't need to be in context — they are in the cumulative summary.
+    if (room.chatHistory.length > 14) {
       const systemMsgs = room.chatHistory.filter((m) => m.role === 'system');
       const nonSystem = room.chatHistory.filter((m) => m.role !== 'system');
-      room.chatHistory = [...systemMsgs.slice(0, 2), ...nonSystem.slice(-24)];
+      room.chatHistory = [...systemMsgs.slice(0, 2), ...nonSystem.slice(-12)];
     }
 
     if (!env.OPENROUTER_API_KEY) {
@@ -673,23 +642,34 @@ const processUserUtterance = async (
     let stream: Awaited<ReturnType<typeof client.chat.completions.create>> | null = null;
     let lastModelError: unknown = null;
 
+    const tokenBudgets = [LLM_MAX_TOKENS, 80, 60];
     for (const attempt of getModelAttemptOrder(room.selectedModel)) {
-      try {
-        stream = await client.chat.completions.create(
-          {
-            model: attempt.id,
-            messages: room.chatHistory,
-            max_tokens: LLM_MAX_TOKENS,
-            temperature: LLM_TEMPERATURE,
-            stream: true,
-          },
-          { signal: abortController.signal },
-        );
-        break;
-      } catch (error) {
-        lastModelError = error;
-        console.warn(`[voice-ws] Model attempt failed for ${attempt.id} in session ${room.sessionId}.`, error);
+      for (const budget of tokenBudgets) {
+        try {
+          stream = await client.chat.completions.create(
+            {
+              model: attempt.id,
+              messages: room.chatHistory,
+              max_tokens: budget,
+              temperature: LLM_TEMPERATURE,
+              stream: true,
+            },
+            { signal: abortController.signal },
+          );
+          break;
+        } catch (error) {
+          const isInsufficientCredits =
+            error instanceof Error && error.message.includes('can only afford');
+          if (isInsufficientCredits && budget > 60) {
+            console.warn(`[voice-ws] Insufficient credits for ${budget} tokens, retrying with fewer.`);
+            continue;
+          }
+          lastModelError = error;
+          console.warn(`[voice-ws] Model attempt failed for ${attempt.id} in session ${room.sessionId}.`, error);
+          break;
+        }
       }
+      if (stream) break;
     }
 
     if (!stream) {
@@ -717,15 +697,6 @@ const processUserUtterance = async (
         sentenceBuffer = sentenceEndMatch[2];
 
         if (completeSentence && !room.interrupted && !room.closed) {
-          broadcastJson(room, {
-            type: 'transcript',
-            speaker: 'mirror',
-            partnerRole: 'mirror',
-            partnerName: 'Mirror',
-            text: completeSentence,
-            isFinal: true,
-            speechFinal: false,
-          });
           await synthesizeAndBroadcast(room, completeSentence, abortController);
         }
       }
@@ -733,15 +704,6 @@ const processUserUtterance = async (
 
     // Process remaining text
     if (sentenceBuffer.trim() && !room.interrupted && !room.closed) {
-      broadcastJson(room, {
-        type: 'transcript',
-        speaker: 'mirror',
-        partnerRole: 'mirror',
-        partnerName: 'Mirror',
-        text: sentenceBuffer.trim(),
-        isFinal: true,
-        speechFinal: true,
-      });
       await synthesizeAndBroadcast(room, sentenceBuffer.trim(), abortController);
     }
 
@@ -813,8 +775,18 @@ const synthesizeAndBroadcast = async (
 
     if (room.closed || room.interrupted) return;
 
-    // Send audio to ALL connected partners
-    broadcastJson(room, { type: 'audio_start', text });
+    // Send transcript + audio together so text appears when audio plays
+    broadcastJson(room, {
+      type: 'audio_start',
+      text,
+      transcript: {
+        speaker: 'mirror',
+        partnerRole: 'mirror',
+        partnerName: 'Mirror',
+        text,
+        isFinal: true,
+      },
+    });
     broadcastBinary(room, audioBuffer);
     broadcastJson(room, { type: 'audio_end' });
   } catch (error) {
@@ -893,14 +865,13 @@ const getOrCreateRoom = async (sessionId: string): Promise<SessionRoom | null> =
   const partnerAName = couple.partnerAName || 'Partner A';
   const partnerBName = couple.partnerBName || 'Partner B';
 
-  // Build homework context from couple data (current reflections to discuss)
+  // Build homework context from couple data (current reflections to discuss this session)
   const homeworkReflections = buildHomeworkContext(couple);
 
-  // Build full reflection history from vector memory (ALL past reflections)
   const coupleIdStr = String(sessionDoc.coupleId);
-  const fullReflectionHistory = await buildFullReflectionContext(couple, coupleIdStr);
 
-  // Build opening context from session data (now enriched with memory)
+  // Opening context comes from the session doc — it was built at session-creation time
+  // from couple.memorySummary (rolling cumulative summary) + current homework reflections.
   const openingContext = sessionDoc.openingContext || '';
 
   // Determine if there are reflections to discuss
@@ -938,7 +909,6 @@ const getOrCreateRoom = async (sessionId: string): Promise<SessionRoom | null> =
     couple,
     openingContext,
     homeworkReflections,
-    fullReflectionHistory,
     reflectionOpeningLine,
     hasReflections,
     sessionStarted: hasExistingTranscripts,
@@ -962,8 +932,8 @@ const getOrCreateRoom = async (sessionId: string): Promise<SessionRoom | null> =
         rebuilt.push({ role: 'assistant', content: seg.text });
       }
     }
-    // Keep system prompt + last 24 conversation messages to stay within context
-    const trimmed = rebuilt.slice(-24);
+    // Keep system prompt + last 12 conversation messages (6 exchanges).
+    const trimmed = rebuilt.slice(-12);
     room.chatHistory = [...systemMessage, ...trimmed];
     console.info(`[voice-ws] Rebuilt chat history with ${trimmed.length} messages for session ${sessionId}`);
   } else {
@@ -1005,6 +975,14 @@ const resolvePartner = (
 /* ------------------------------------------------------------------ */
 /*  WebSocket server attachment                                        */
 /* ------------------------------------------------------------------ */
+
+/** Update the selected model for a live in-memory room (if it exists). */
+export const updateRoomModel = (sessionId: string, modelId: string): void => {
+  const room = activeRooms.get(sessionId);
+  if (room) {
+    room.selectedModel = modelId;
+  }
+};
 
 export const attachVoiceWebSocket = (server: Server): void => {
   const wss = new WebSocketServer({ noServer: true });
